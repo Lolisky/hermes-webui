@@ -700,3 +700,64 @@ def test_expired_streaming_hint_cannot_outlive_the_producer_ttl(profiles, monkey
     # A full enumeration ran (the trailing ('old-one',) read is master's
     # pre-existing oneshot fallback, not the hint path).
     assert None in loads, f"expected a full enumeration, got {loads}"
+
+
+# ── 11. The all-profiles identity is its own shape ────────────────────────
+
+
+def test_all_profiles_stale_lkg_defers_after_an_external_write(profiles):
+    """A write to a NON-active profile must invalidate the aggregate hint.
+
+    The aggregate key's volatile component is the per-profile context tuple
+    (index 3), not the stable profile-home list (index 4). Those two are easy
+    to confuse, and confusing them makes every expired aggregate snapshot look
+    current — an external write would then resurrect rows forever. This pins
+    the correct index by exercising exactly that write.
+    """
+    state, homes = profiles
+    db_alpha = homes["alpha"] / "state.db"
+    db_bravo = homes["bravo"] / "state.db"
+    _make_state_db(db_alpha, [("old-one", "cli", "Old one")])
+    _make_state_db(db_bravo, [("bravo-one", "cli", "Bravo one")])
+
+    primed = {r["session_id"] for r in models.get_cli_sessions(all_profiles=True)}
+    assert {"old-one", "bravo-one"} <= primed
+
+    # An external writer pushes newer sessions into the INACTIVE profile only.
+    conn = sqlite3.connect(str(db_bravo))
+    try:
+        for i in range(40):
+            started = 1781024055.0 + 100 + i
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(id, source, model, message_count, started_at, title, cwd) "
+                "VALUES (?, 'cli', 'test-model', 2, ?, ?, '/tmp')",
+                (f"new-{i:02d}", started, f"New {i}"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, 'user', 'hi', ?)",
+                (f"new-{i:02d}", started),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    loads = []
+    real_load = models._load_cli_sessions_uncached
+
+    def _counting(*args, **kwargs):
+        loads.append(kwargs.get("session_ids"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
+        # old-one is still in the window, so it answers — but it must be the
+        # ENUMERATION that decided, not the pre-write snapshot.
+        assert models.lookup_cli_session_row("old-one", all_profiles=True)["session_id"] == (
+            "old-one"
+        )
+        assert None in loads, f"the aggregate snapshot survived an external write: {loads}"
+    finally:
+        monkeypatch.undo()

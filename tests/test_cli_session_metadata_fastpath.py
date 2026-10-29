@@ -601,3 +601,42 @@ def test_frozen_last_known_good_never_proves_membership(stubbed_catalog, monkeyp
     )
     assert models.lookup_cli_session_row(ROWS[0]["session_id"]) == {}
     assert enumerations == [1]
+
+
+def test_claude_code_hint_does_not_pay_an_unanswerable_read(stubbed_catalog, monkeypatch):
+    """A Claude Code hint must not spend a bounded read that can only say ``{}``.
+
+    Those rows are global rather than profile-owned, and the bounded reader
+    loads with ``include_claude_code=False``, so it can neither confirm nor
+    refute them. Reading anyway would add a pointless round trip to every
+    Claude Code lookup while the enumeration decides regardless.
+    """
+    rows = [
+        {
+            "session_id": "cc-1",
+            "profile": "default",
+            "raw_source": "claude_code",
+            "source_tag": "claude_code",
+            "title": "Claude Code",
+        }
+    ]
+    monkeypatch.setattr(
+        models, "_load_cli_sessions_uncached", lambda *a, **kw: [dict(r) for r in rows]
+    )
+    models.clear_cli_sessions_cache()
+    assert models.get_cli_sessions()  # prime
+
+    reads = []
+    monkeypatch.setattr(
+        models, "get_cli_session_by_id", lambda *a, **kw: reads.append(1) or {}
+    )
+    enumerations = []
+    monkeypatch.setattr(
+        models,
+        "get_cli_sessions",
+        lambda *a, **kw: enumerations.append(1) or [dict(rows[0])],
+    )
+
+    assert models.lookup_cli_session_row("cc-1")["session_id"] == "cc-1"
+    assert reads == [], "the bounded reader cannot answer a Claude Code row"
+    assert enumerations == [1], "the enumeration must decide"

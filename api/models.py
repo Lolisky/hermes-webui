@@ -10297,6 +10297,13 @@ def _confirm_cli_session_hint(
         source = _normalize_cli_session_source_filter(source)
         if not source:
             return None
+        if source == CLAUDE_CODE_SOURCE:
+            # Claude Code rows are global rather than profile-owned, and the
+            # bounded reader loads with ``include_claude_code=False`` — so a
+            # read here can only ever answer ``{}``. That is not evidence of
+            # absence, and paying for it on every Claude Code lookup would be
+            # pure waste; let the enumeration decide instead.
+            return None
         confirmed = get_cli_session_by_id(
             session_id, source, all_profiles=all_profiles,
         )
