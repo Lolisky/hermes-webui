@@ -411,18 +411,24 @@ def test_warm_does_not_publish_an_incomplete_aggregate(profiles, monkeypatch):
 
 
 def test_recency_eviction_is_not_undone_by_the_confirmation_read(profiles):
-    """A session evicted from the recency window must stay absent.
+    """A session evicted from the catalog window must stay absent.
 
-    The bounded confirmation read (``get_cli_session_by_id``) is subject to
-    the *same* window as the enumeration, so a hint cannot resurrect a row the
-    sidebar no longer shows. This pins that the fast path inherits the
-    producer's window rather than widening it.
+    ``get_cli_session_by_id`` deliberately resolves explicit opens *outside*
+    any recency window (#8265), so a source-scoped confirmation is not a
+    catalog-membership check. The fast path must therefore prove membership
+    itself: when the snapshot no longer describes the current catalog it has
+    to defer to the enumeration, which is the only thing that knows the
+    window.
+
+    The lookup happens BEFORE any re-enumeration on purpose: enumerating first
+    would replace the snapshot and hide the stale-hint schedule entirely.
     """
     state, homes = profiles
     db = homes["alpha"] / "state.db"
     _make_state_db(db, [("old-one", "cli", "Old one")])
 
     models.get_cli_sessions()  # prime while it is still in the window
+    # Positive control: while it is in the window the fast path answers.
     assert models.lookup_cli_session_row("old-one")["session_id"] == "old-one"
 
     # Many newer sessions push it out of the bounded window; the row itself
@@ -446,10 +452,11 @@ def test_recency_eviction_is_not_undone_by_the_confirmation_read(profiles):
     finally:
         conn.close()
 
-    enumerated = {r["session_id"] for r in models.get_cli_sessions()}
-    assert "old-one" not in enumerated, "window should have evicted it"
-    # The fast path agrees with the enumeration instead of resurrecting it.
-    assert models.lookup_cli_session_row("old-one") == {}
+    # Look up through the consumer BEFORE anything re-enumerates.
+    assert routes._lookup_cli_session_metadata("old-one") == {}
+
+    # And the enumeration it deferred to agrees.
+    assert "old-one" not in {r["session_id"] for r in models.get_cli_sessions()}
 
 
 def test_streaming_transition_keeps_serving_the_confirmed_row(profiles, monkeypatch):
@@ -479,3 +486,103 @@ def test_streaming_transition_keeps_serving_the_confirmed_row(profiles, monkeypa
     finally:
         conn.close()
     assert models.lookup_cli_session_row("mid-turn")["title"] == "Renamed mid-turn"
+
+
+# ── 9. The optimisation itself, proven on a real store ───────────────────
+
+
+def test_current_snapshot_answers_without_reprojecting(profiles, monkeypatch):
+    """A lookup against an unchanged catalog must not re-run the projection.
+
+    This is the whole point of the change, asserted against a real state.db:
+    the snapshot describes the current revision, so membership is proven and
+    the answer comes from the snapshot plus one bounded read.
+    """
+    state, homes = profiles
+    _make_state_db(homes["alpha"] / "state.db", [("live-one", "cli", "Live one")])
+
+    models.get_cli_sessions()  # prime
+    loads = []
+    real_load = models._load_cli_sessions_uncached
+
+    def _counting(*args, **kwargs):
+        loads.append(kwargs.get("session_ids"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
+
+    row = models.lookup_cli_session_row("live-one")
+    assert row["session_id"] == "live-one"
+    # Exactly one bounded single-SID read; no full projection.
+    assert loads == [("live-one",)], loads
+
+
+def test_expired_but_unchanged_snapshot_still_answers(profiles, monkeypatch):
+    """TTL expiry alone must not force a re-projection.
+
+    Expiry changes freshness, not membership: the revision is unchanged, so the
+    snapshot still describes the current catalog and the bounded read confirms
+    the content.
+    """
+    state, homes = profiles
+    _make_state_db(homes["alpha"] / "state.db", [("ttl-one", "cli", "TTL one")])
+
+    models.get_cli_sessions()  # prime
+    # Force every primary entry to be long-expired without touching its stamp.
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        for key in list(models._CLI_SESSIONS_CACHE):
+            entry = models._CLI_SESSIONS_CACHE[key]
+            models._CLI_SESSIONS_CACHE[key] = (0.0, entry[1], entry[2])
+
+    loads = []
+    real_load = models._load_cli_sessions_uncached
+
+    def _counting(*args, **kwargs):
+        loads.append(kwargs.get("session_ids"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
+
+    assert models.lookup_cli_session_row("ttl-one")["session_id"] == "ttl-one"
+    assert loads == [("ttl-one",)], loads
+
+
+def test_changed_revision_falls_back_to_the_enumeration(profiles, monkeypatch):
+    """Once the catalog revision moves, the snapshot may not answer.
+
+    Membership cannot be proven against a different revision — the row may have
+    left the window or the store — so the lookup must defer to the enumeration
+    even though the hint still carries the row.
+    """
+    state, homes = profiles
+    db = homes["alpha"] / "state.db"
+    _make_state_db(db, [("moved-one", "cli", "Moved one")])
+
+    models.get_cli_sessions()  # prime at revision R1
+
+    # An unrelated write advances the revision without touching moved-one.
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES ('moved-one', 'user', 'another', 1781099999.0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    loads = []
+    real_load = models._load_cli_sessions_uncached
+
+    def _counting(*args, **kwargs):
+        loads.append(kwargs.get("session_ids"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
+
+    # The row is still there and still current — but membership is now proved
+    # by the enumeration, not by the stale snapshot.
+    assert models.lookup_cli_session_row("moved-one")["session_id"] == "moved-one"
+    assert loads and loads[-1] is None, (
+        f"expected a full enumeration, got {loads}"
+    )

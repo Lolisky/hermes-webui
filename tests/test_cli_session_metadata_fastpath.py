@@ -150,18 +150,17 @@ def test_metadata_lookup_honours_a_replaced_enumeration(stubbed_catalog, monkeyp
     assert routes._lookup_cli_session_metadata("not-in-the-enumeration") == {}
 
 
-def test_lookup_survives_a_cache_key_churn(stubbed_catalog, monkeypatch):
-    """A state.db fingerprint change must not force a re-projection.
+def test_lookup_survives_primary_cache_eviction(stubbed_catalog, monkeypatch):
+    """A primary-cache eviction must not force a re-projection.
 
-    The primary cache key embeds a live ``state.db`` fingerprint. The
-    last-known-good map is keyed by the stable identity precisely so a single
-    agent write does not invalidate an otherwise usable snapshot.
+    The primary map is bounded; the last-known-good map keeps the same rows
+    under the stable identity. While the catalog revision is unchanged that
+    snapshot still describes the current catalog, so it may answer.
     """
     target = ROWS[1]["session_id"]
     assert models.lookup_cli_session_row(target)["session_id"] == target
 
-    # Drop every primary-cache entry while keeping the last-known-good map, which
-    # is what a changed fingerprint looks like to a lookup: exact-key miss.
+    # Drop every primary-cache entry while keeping the last-known-good map.
     with models._CLI_SESSIONS_CACHE_LOCK:
         models._CLI_SESSIONS_CACHE.clear()
 
@@ -180,13 +179,64 @@ def test_lookup_survives_a_cache_key_churn(stubbed_catalog, monkeypatch):
     )
 
 
-def test_returned_row_is_a_defensive_copy(stubbed_catalog):
-    """Mutating the returned row must not poison the cached snapshot."""
+def test_last_known_good_does_not_answer_a_changed_revision(
+    stubbed_catalog, monkeypatch
+):
+    """A snapshot from a different revision is a fallback, not a catalog.
+
+    The last-known-good key deliberately drops the state.db revision, so the
+    entry can still be found after a write. Its rows, however, may have left
+    the producer's window since — membership is only proven when the revision
+    it was taken at still matches, otherwise the enumeration must decide.
+    """
     target = ROWS[0]["session_id"]
+    assert models.lookup_cli_session_row(target)["session_id"] == target
+
+    # Drop the primary cache and age the LKG entry to a different revision.
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        models._CLI_SESSIONS_CACHE.clear()
+        for key, entry in list(models._CLI_SESSIONS_LAST_KNOWN_GOOD.items()):
+            models._CLI_SESSIONS_LAST_KNOWN_GOOD[key] = (
+                entry[0], entry[1], ("stale-revision",),
+            )
+
+    # Even a willing confirmation reader must not rescue the stale snapshot.
+    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
+    enumerations = []
+    monkeypatch.setattr(
+        models, "get_cli_sessions", lambda *a, **kw: enumerations.append(1) or []
+    )
+
+    assert models.lookup_cli_session_row(target) == {}
+    assert enumerations == [1], "a stale-revision snapshot must defer to enumeration"
+
+
+def test_returned_row_is_a_defensive_copy(stubbed_catalog, monkeypatch):
+    """Mutating the returned row must not poison the cached snapshot.
+
+    The lookup is served from a *primed positive cache entry*, and the live
+    reader is made to hand back the cached row object itself — the exact
+    aliasing the first cut of this PR had. Without a defensive copy, mutating
+    the answer poisons the snapshot for every later request.
+    """
+    target = ROWS[0]["session_id"]
+    models.get_cli_sessions()  # prime a positive cache entry
+
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        cached_rows = [r for entry in models._CLI_SESSIONS_CACHE.values() for r in entry[2]]
+    assert cached_rows, "the positive cache entry should still be there"
+    aliased = next(r for r in cached_rows if r["session_id"] == target)
+    monkeypatch.setattr(
+        models, "get_cli_session_by_id", lambda sid, source, **kw: aliased
+    )
+
     row = models.lookup_cli_session_row(target)
     assert row["title"] == "Fastpath A"
+    assert row is not aliased, "the answer aliased the cached snapshot"
     row["title"] = "mutated by the caller"
-    assert models.lookup_cli_session_row(target)["title"] == "Fastpath A"
+    assert aliased["title"] == "Fastpath A", (
+        "mutating the answer poisoned the cached snapshot"
+    )
 
 
 # ── Review round 2: the hint must never outlive the producer's scope ───────

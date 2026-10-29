@@ -9727,6 +9727,22 @@ def _cli_sessions_stable_cache_identity(cache_key: tuple) -> tuple:
     return (*cache_key[:4], *cache_key[5:]) if len(cache_key) > 4 else cache_key
 
 
+def _cli_sessions_volatile_cache_identity(cache_key: tuple) -> tuple:
+    """Return the state.db revision component that :func:`...stable...` drops.
+
+    A snapshot whose volatile component still equals the current one describes
+    the *current* catalog, so its rows are exactly what the enumeration would
+    return right now. That is the only cheap membership proof available: the
+    window itself (recency slice plus the producer's projection and recovery
+    passes) cannot be reproduced without running the projection.
+    """
+    if cache_key and cache_key[0] == 'all_profiles':
+        # Index 3 is the per-profile context key (or the streaming freeze).
+        return (cache_key[3],) if len(cache_key) > 3 else ()
+    # Single-profile keys place the volatile DB fingerprint at index 4.
+    return (cache_key[4],) if len(cache_key) > 4 else ()
+
+
 def _copy_last_known_good_cli_sessions(stable_key: tuple, invalidation_stamp: int):
     with _CLI_SESSIONS_CACHE_LOCK:
         entry = _CLI_SESSIONS_LAST_KNOWN_GOOD.get(stable_key)
@@ -9755,6 +9771,11 @@ def _cache_cli_sessions_if_current(
         _CLI_SESSIONS_LAST_KNOWN_GOOD[stable_key] = (
             invalidation_stamp,
             _copy_cli_sessions(copied_sessions),
+            # The revision this snapshot was taken at. A reader that wants to
+            # treat the rows as the CURRENT catalog (rather than as a
+            # last-known-good fallback) must match this, because the stable key
+            # alone deliberately cannot tell revisions apart.
+            _cli_sessions_volatile_cache_identity(cache_key),
         )
         _CLI_SESSIONS_LAST_KNOWN_GOOD.move_to_end(stable_key)
         while len(_CLI_SESSIONS_LAST_KNOWN_GOOD) > _CLI_SESSIONS_LAST_KNOWN_GOOD_MAX_ENTRIES:
@@ -9948,20 +9969,30 @@ def _cli_sessions_hint_candidates(*, all_profiles: bool) -> list:
     """Collect candidate hint snapshots for the CALLER's exact identity.
 
     Returns ``[(is_fresh, expires_at, rows), ...]`` ordered best-first (fresh
-    snapshots first, then the most recently expired). Both the primary cache and
-    the stable-identity last-known-good map are consulted, but only under the
-    identity the request actually resolves to: the primary cache entry is used
-    only when its key EQUALS the caller's current full cache key, and the LKG
-    entry only under the stable projection of that same key (which drops just
-    the volatile state.db fingerprint component). Entries whose invalidation
-    stamp no longer matches are skipped — they describe a catalog that was
-    explicitly cleared.
+    snapshots first, then the most recently expired).
+
+    **Membership is the invariant here.** A hint may only answer if its rows are
+    what a current enumeration would return, and the only cheap proof of that is
+    "the snapshot was taken at the current state.db revision". So both sources
+    are read under the caller's complete per-request identity AND must match the
+    volatile revision component:
+
+    * the primary cache, whose key already embeds the current revision, and
+    * the last-known-good entry, which drops that component from its key and
+      therefore has to carry the revision it was taken at alongside its rows.
+
+    An entry from a different revision is a *last-known-good fallback*, not a
+    catalog, and is deliberately not used here: its rows may have left the
+    producer's window (or the store entirely) since it was built. Entries whose
+    invalidation stamp no longer matches are skipped too — they describe a
+    catalog that was explicitly cleared.
     """
     try:
         full_key, _load = _cli_sessions_lookup_identity(all_profiles=all_profiles)
         if full_key is None:
             return []
         stable_key = _cli_sessions_stable_cache_identity(full_key)
+        volatile_now = _cli_sessions_volatile_cache_identity(full_key)
     except Exception:
         logger.debug("CLI sessions lookup identity failed", exc_info=True)
         return []
@@ -9984,11 +10015,19 @@ def _cli_sessions_hint_candidates(*, all_profiles: bool) -> list:
                 candidates.append((bool(expires_at > now), expires_at, sessions))
         lkg = _CLI_SESSIONS_LAST_KNOWN_GOOD.get(stable_key)
         if lkg is not None:
+            entry_stamp = None
+            entry_volatile = None
+            sessions = None
             try:
-                entry_stamp, sessions = lkg
+                entry_stamp, sessions = lkg[0], lkg[1]
+                entry_volatile = lkg[2] if len(lkg) > 2 else None
             except Exception:
                 sessions = None
-            if sessions is not None and entry_stamp == stamp_now:
+            if (
+                sessions is not None
+                and entry_stamp == stamp_now
+                and entry_volatile == volatile_now
+            ):
                 candidates.append((False, 0.0, sessions))
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return candidates
