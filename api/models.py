@@ -10202,11 +10202,6 @@ def _cli_sessions_lookup_identity(*, all_profiles: bool):
     return cache_key, _load_one
 
 
-def _cli_sessions_cli_invalidation_stamp() -> int:
-    with _CLI_SESSIONS_CACHE_LOCK:
-        return int(_CLI_SESSIONS_CACHE_INVALIDATION_VERSION)
-
-
 def _cli_sessions_first_row_by_id(sessions, session_id: str):
     """Return the FIRST row matching ``session_id``.
 
