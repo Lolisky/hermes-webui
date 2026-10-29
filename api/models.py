@@ -10004,6 +10004,13 @@ def _cli_sessions_hint_candidates(*, all_profiles: bool) -> list:
     catalog that was explicitly cleared.
     """
     try:
+        # With the cache disabled the producer never reads its cache at all
+        # (``get_cli_sessions`` gates its whole cache path on ``ttl > 0``), so
+        # it re-projects on every call. A hint here would answer what the
+        # producer would have rebuilt, which is exactly the divergence this
+        # path must not introduce.
+        if _cli_sessions_cache_ttl_seconds() <= 0:
+            return []
         full_key, _load = _cli_sessions_lookup_identity(all_profiles=all_profiles)
         if full_key is None:
             return []
@@ -10315,6 +10322,16 @@ def _confirm_cli_session_hint(
         return None
     if not confirmed:
         return {}
+    # The bounded reader resolves a SID per profile in aggregate order, so in a
+    # multi-profile install it can return an EARLIER profile's row for the same
+    # SID — one that profile's own catalog window no longer contains, while the
+    # aggregate enumeration returned the later owner. A confirmation that does
+    # not reproduce the hinted owner is therefore not a confirmation.
+    if (
+        confirmed.get('session_id') != row.get('session_id')
+        or confirmed.get('profile') != row.get('profile')
+    ):
+        return None
     return _copy_cli_sessions([confirmed])[0]
 
 

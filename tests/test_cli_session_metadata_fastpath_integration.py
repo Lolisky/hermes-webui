@@ -761,3 +761,47 @@ def test_all_profiles_stale_lkg_defers_after_an_external_write(profiles):
         assert None in loads, f"the aggregate snapshot survived an external write: {loads}"
     finally:
         monkeypatch.undo()
+
+
+def test_aggregate_does_not_substitute_an_earlier_profiles_out_of_window_row(profiles):
+    """The confirmation read must not swap the aggregate's owner.
+
+    Same SID in both profiles, but alpha's copy has been pushed out of alpha's
+    own window by newer sessions while bravo's copy is still in bravo's. The
+    aggregate enumeration therefore answers with bravo's row. The bounded
+    reader resolves per profile in aggregate order and would hand back alpha's
+    out-of-window row — which is a different owner, not a confirmation.
+    """
+    state, homes = profiles
+    db_alpha = homes["alpha"] / "state.db"
+    db_bravo = homes["bravo"] / "state.db"
+    _make_state_db(db_alpha, [("shared", "cli", "Alpha copy")])
+    _make_state_db(db_bravo, [("shared", "cli", "Bravo copy")])
+
+    # Bury alpha's copy outside alpha's window.
+    conn = sqlite3.connect(str(db_alpha))
+    try:
+        for i in range(40):
+            started = 1781024055.0 + 100 + i
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(id, source, model, message_count, started_at, title, cwd) "
+                "VALUES (?, 'cli', 'test-model', 2, ?, ?, '/tmp')",
+                (f"alpha-new-{i:02d}", started, f"Alpha {i}"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, 'user', 'hi', ?)",
+                (f"alpha-new-{i:02d}", started),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    enumerated = models.get_cli_sessions(all_profiles=True)
+    owner = next(r for r in enumerated if r["session_id"] == "shared")
+    assert owner["profile"] == "bravo", "bravo should own the aggregate row"
+
+    got = models.lookup_cli_session_row("shared", all_profiles=True)
+    assert got["profile"] == owner["profile"]
+    assert got["title"] == owner["title"]

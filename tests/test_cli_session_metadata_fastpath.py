@@ -640,3 +640,49 @@ def test_claude_code_hint_does_not_pay_an_unanswerable_read(stubbed_catalog, mon
     assert models.lookup_cli_session_row("cc-1")["session_id"] == "cc-1"
     assert reads == [], "the bounded reader cannot answer a Claude Code row"
     assert enumerations == [1], "the enumeration must decide"
+
+
+def test_disabled_cache_never_answers_from_a_snapshot(stubbed_catalog, monkeypatch):
+    """With the CLI cache disabled the producer re-projects, so must the lookup.
+
+    ``get_cli_sessions`` gates its whole cache path on ``ttl > 0``. Serving an
+    expired snapshot here would answer what the producer would have rebuilt.
+    """
+    models.get_cli_sessions()  # prime a real entry
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 0)
+
+    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
+    enumerations = []
+    monkeypatch.setattr(
+        models, "get_cli_sessions", lambda *a, **kw: enumerations.append(1) or []
+    )
+    assert models.lookup_cli_session_row(ROWS[0]["session_id"]) == {}
+    assert enumerations == [1]
+
+
+def test_confirmation_must_reproduce_the_hinted_owner(stubbed_catalog, monkeypatch):
+    """A confirmation that returns another profile's row is not a confirmation.
+
+    In a multi-profile install the bounded reader resolves a SID per profile in
+    aggregate order, so it can hand back an EARLIER profile's row for the same
+    SID even when that profile's own window no longer contains it. The hint's
+    owner is the aggregate enumeration's answer, so a mismatch must fall
+    through rather than substitute the other owner.
+    """
+    target = ROWS[0]["session_id"]
+    models.get_cli_sessions()  # prime
+    assert models.lookup_cli_session_row(target)["profile"] == "default"
+
+    monkeypatch.setattr(
+        models,
+        "get_cli_session_by_id",
+        lambda sid, source, **kw: dict(ROWS[0], profile="alpha"),
+    )
+    enumerations = []
+    monkeypatch.setattr(
+        models,
+        "get_cli_sessions",
+        lambda *a, **kw: enumerations.append(1) or [dict(ROWS[0])],
+    )
+    assert models.lookup_cli_session_row(target)["profile"] == "default"
+    assert enumerations == [1], "a foreign-owner confirmation must defer"
