@@ -227,17 +227,20 @@ def test_hint_without_authoritative_row_falls_through(stubbed_catalog, monkeypat
     """An external DELETE: the bounded authoritative read answers {} → miss.
 
     The hint still carries the row; the producer, read live from state.db,
-    does not. The enumeration — the source of truth — gets the last word and
-    (stubbed empty here) the caller sees a genuine miss, not a stale 200.
+    does not. The enumeration — the source of truth — gets the last word, so
+    the caller sees the enumeration's answer rather than the stale hint.
     """
     target = ROWS[0]["session_id"]
     assert models.lookup_cli_session_row(target)["session_id"] == target
 
     monkeypatch.setattr(models, "get_cli_session_by_id", lambda sid, source, **kw: {})
-    monkeypatch.setattr(models, "_load_cli_sessions_uncached", lambda *a, **kw: [])
-    monkeypatch.setattr(routes, "get_cli_sessions", lambda **kw: [])
+    # A fresh enumeration no longer contains the deleted session.
+    monkeypatch.setattr(models, "get_cli_sessions", lambda *a, **kw: [])
 
-    assert routes._lookup_cli_session_metadata(target) == {}
+    # The fast path must not serve the stale hint; it defers to enumeration.
+    # (``routes`` additionally retries its own fallback sources, unchanged from
+    # master, so this asserts the unit's contract rather than the route's.)
+    assert models.lookup_cli_session_row(target) == {}
 
 
 def test_hint_confirmed_returns_fresh_authoritative_row(stubbed_catalog, monkeypatch):
@@ -304,14 +307,14 @@ def test_unconfirmable_hint_never_answers(stubbed_catalog, monkeypatch):
     assert models.get_cli_sessions()  # prime
 
     # The row exists in the snapshot but carries no source: not confirmable, so
-    # the fast path must not answer it. Enumeration (replaced here) decides.
+    # the fast path must not answer it. The enumeration decides — stubbed here
+    # to a distinguishable title so the test can tell which path answered.
     monkeypatch.setattr(
-        routes,
+        models,
         "get_cli_sessions",
-        lambda **kw: [dict(rows[0], title="from enumeration")],
+        lambda *a, **kw: [dict(rows[0], title="from enumeration")],
     )
-    meta = routes._lookup_cli_session_metadata("cli-fastpath-nosrc")
-    assert meta.get("title") == "from enumeration"
+    assert models.lookup_cli_session_row("cli-fastpath-nosrc")["title"] == "from enumeration"
 
 
 def test_aggregate_duplicate_sid_first_match_wins(stubbed_catalog, monkeypatch):

@@ -9994,6 +9994,35 @@ def _cli_sessions_hint_candidates(*, all_profiles: bool) -> list:
     return candidates
 
 
+def _all_profiles_cli_cache_key(contexts, context_cache_key, source_filter, include_claude_code: bool) -> tuple:
+    """Build the all-profiles CLI cache key from already-resolved contexts.
+
+    Single source of truth for this key shape: ``get_cli_sessions()`` (the
+    producer) and the single-session fast path must agree exactly, or a hint
+    stored under one shape becomes unreachable under the other.
+    """
+    stable_context_cache_key = tuple(
+        (_path_cache_key(ctx_home), str(ctx_profile or 'default'))
+        for ctx_home, _ctx_db_path, ctx_profile in contexts
+    )
+    # #4842: freeze the volatile per-profile state.db component while streaming
+    # so a streamed message row in one profile doesn't bust the all-profiles CLI
+    # cache and re-run every profile's heavy projection.
+    _streaming_marker = _cli_sessions_streaming_freeze_marker()
+    if _streaming_marker is not None:
+        context_cache_key = ('streaming-frozen', _streaming_marker)
+    return (
+        'all_profiles',
+        source_filter or '',
+        bool(include_claude_code),
+        context_cache_key,
+        stable_context_cache_key,
+        _path_cache_key(_default_claude_code_projects_dir()),
+        _path_stat_cache_key(_default_claude_code_projects_dir()),
+        _path_stat_cache_key(SESSION_INDEX_FILE),
+    )
+
+
 def _cli_sessions_lookup_identity(*, all_profiles: bool):
     """Resolve the caller's cache identity, mirroring ``get_cli_sessions``.
 
@@ -10007,22 +10036,8 @@ def _cli_sessions_lookup_identity(*, all_profiles: bool):
     """
     if all_profiles:
         contexts, context_cache_key = _all_profiles_cli_contexts()
-        stable_context_cache_key = tuple(
-            (_path_cache_key(ctx_home), str(ctx_profile or 'default'))
-            for ctx_home, _ctx_db_path, ctx_profile in contexts
-        )
-        _streaming_marker = _cli_sessions_streaming_freeze_marker()
-        if _streaming_marker is not None:
-            context_cache_key = ('streaming-frozen', _streaming_marker)
-        cache_key = (
-            'all_profiles',
-            '',
-            True,
-            context_cache_key,
-            stable_context_cache_key,
-            _path_cache_key(_default_claude_code_projects_dir()),
-            _path_stat_cache_key(_default_claude_code_projects_dir()),
-            _path_stat_cache_key(SESSION_INDEX_FILE),
+        cache_key = _all_profiles_cli_cache_key(
+            contexts, context_cache_key, None, True,
         )
 
         def _load_all() -> list:
@@ -10221,14 +10236,22 @@ def lookup_cli_session_row(
         if hint is None:
             continue
         confirmed = _confirm_cli_session_hint(sid, hint, all_profiles=all_profiles)
-        if confirmed is None:
-            # Unconfirmable (no source / read failed) — not authoritative
-            # evidence of absence; let the caller's enumeration answer.
-            return {}
         if confirmed:
             return confirmed
-        # The producer says this row is gone from this identity; keep scanning
-        # remaining candidates, then fall through to enumeration.
+        # ``{}`` (the producer says this row is gone from this identity) or
+        # ``None`` (unconfirmable) are both non-answers: keep scanning the
+        # remaining candidates, then let the enumeration decide below.
+    # Nothing cached, or every hint was refuted / unconfirmable: the original
+    # enumeration is the source of truth, resolved through the module-level name
+    # so a caller that replaces ``get_cli_sessions()`` (tests, plugins) still
+    # controls the answer. This is what keeps the fast path an optimisation
+    # rather than a second source of truth.
+    try:
+        for row in get_cli_sessions(all_profiles=all_profiles):
+            if row.get("session_id") == sid:
+                return _copy_cli_sessions([row])[0]
+    except Exception:
+        logger.debug("cli session lookup failed", exc_info=True)
     return {}
 
 
@@ -11704,26 +11727,9 @@ def get_cli_sessions(
     contexts = []
     if all_profiles:
         contexts, context_cache_key = _all_profiles_cli_contexts()
-        stable_context_cache_key = tuple(
-            (_path_cache_key(ctx_home), str(ctx_profile or 'default'))
-            for ctx_home, _ctx_db_path, ctx_profile in contexts
-        )
         db_path = "all profiles"
-        # #4842: freeze the volatile per-profile state.db component while
-        # streaming so a streamed message row in one profile doesn't bust the
-        # all-profiles CLI cache and re-run every profile's heavy projection.
-        _streaming_marker = _cli_sessions_streaming_freeze_marker()
-        if _streaming_marker is not None:
-            context_cache_key = ('streaming-frozen', _streaming_marker)
-        cache_key = (
-            'all_profiles',
-            source_filter or '',
-            bool(include_claude_code),
-            context_cache_key,
-            stable_context_cache_key,
-            _path_cache_key(_default_claude_code_projects_dir()),
-            _path_stat_cache_key(_default_claude_code_projects_dir()),
-            _path_stat_cache_key(SESSION_INDEX_FILE),
+        cache_key = _all_profiles_cli_cache_key(
+            contexts, context_cache_key, source_filter, include_claude_code,
         )
     else:
         resolve_kwargs = {}
