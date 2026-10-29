@@ -322,3 +322,40 @@ def test_all_profiles_duplicate_sid_uses_enumeration_order(profiles):
 
     got = models.lookup_cli_session_row("dup-sid", all_profiles=True)
     assert got["title"] == first["title"]
+
+
+# ── 6. Startup warm → named-profile lookup ────────────────────────────────
+
+
+def test_startup_warm_then_named_profile_lookup(profiles):
+    """The startup warm primes the ACTIVE identity; a later switch must not
+    inherit it, and must not be blocked by it."""
+    import threading
+
+    state, homes = profiles
+    _make_state_db(homes["alpha"] / "state.db", [("alpha-only", "cli", "Alpha only")])
+    _make_state_db(homes["bravo"] / "state.db", [("bravo-only", "cli", "Bravo only")])
+
+    done = threading.Event()
+    real_load = models._load_and_cache_cli_sessions
+
+    def _watchful(*args, **kwargs):
+        try:
+            return real_load(*args, **kwargs)
+        finally:
+            done.set()
+
+    original = models._load_and_cache_cli_sessions
+    models._load_and_cache_cli_sessions = _watchful
+    try:
+        assert models.warm_cli_sessions_cache_async() is True
+        assert done.wait(15), "startup warm did not run"
+    finally:
+        models._load_and_cache_cli_sessions = original
+
+    # The warm landed on the identity the first lookup resolves.
+    assert models.lookup_cli_session_row("alpha-only")["session_id"] == "alpha-only"
+
+    _switch(state, "bravo")
+    assert models.lookup_cli_session_row("alpha-only") == {}
+    assert models.lookup_cli_session_row("bravo-only")["session_id"] == "bravo-only"
