@@ -359,3 +359,49 @@ def test_startup_warm_then_named_profile_lookup(profiles):
     _switch(state, "bravo")
     assert models.lookup_cli_session_row("alpha-only") == {}
     assert models.lookup_cli_session_row("bravo-only")["session_id"] == "bravo-only"
+
+
+# ── 7. An incomplete aggregate must never be published ────────────────────
+
+
+def test_warm_does_not_publish_an_incomplete_aggregate(profiles, monkeypatch):
+    """If one profile is unavailable, the warm must serve but not cache it.
+
+    ``_load_and_cache_cli_sessions`` treats a plain list as complete, so the
+    warm's aggregate has to carry the producer's completeness accounting —
+    otherwise a profile that was merely unreadable is published as a profile
+    that owns no sessions, and every hint built from it is a lie.
+    """
+    state, homes = profiles
+    _make_state_db(homes["alpha"] / "state.db", [("alpha-only", "cli", "Alpha only")])
+    _make_state_db(homes["bravo"] / "state.db", [("bravo-only", "cli", "Bravo only")])
+
+    real_loader = models._load_cli_sessions_uncached
+
+    def _flaky(home, db_path, profile, **kwargs):
+        if str(profile) == "bravo":
+            raise sqlite3.OperationalError("database is locked")
+        return real_loader(home, db_path, profile, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _flaky)
+
+    key, load = models._cli_sessions_lookup_identity(all_profiles=True)
+    result = load()
+    assert isinstance(result, models._CliSessionsLoadResult)
+    assert result.complete is False, "one profile was unreadable"
+
+    models.clear_cli_sessions_cache()
+    models._load_and_cache_cli_sessions(
+        cache_key=key,
+        ttl=models._cli_sessions_cache_ttl_seconds(),
+        invalidation_stamp=models._cli_sessions_cache_invalidation_stamp(),
+        load_sessions=load,
+        stale_sessions=None,
+        stale_stamp=None,
+        all_profiles=True,
+        db_path="all profiles",
+    )
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        assert key not in models._CLI_SESSIONS_CACHE, (
+            "an incomplete aggregate was published as authoritative"
+        )

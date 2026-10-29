@@ -10040,54 +10040,91 @@ def _cli_sessions_lookup_identity(*, all_profiles: bool):
             contexts, context_cache_key, None, True,
         )
 
-        def _load_all() -> list:
+        def _load_all():
             merged: list = []
+            unavailable_error = None
+            successful_profiles = 0
+            optional_incomplete = False
+            loader_supports_completeness = _callable_accepts_keyword(
+                _load_cli_sessions_uncached, '_with_completeness'
+            )
             for ctx_home, ctx_db_path, ctx_profile in contexts:
+                load_kwargs = {
+                    'source_filter': None,
+                    'visible_session_limit': None,
+                    'project_assigned_limit': PROJECT_ASSIGNED_CLI_LIMIT,
+                    'cron_project_limit': None,
+                    'webhook_project_limit': None,
+                    'kanban_project_limit': None,
+                    # Claude Code is global rather than profile-owned; scan it
+                    # once below so profile 0 availability cannot suppress it.
+                    'include_claude_code': False,
+                }
+                if loader_supports_completeness:
+                    load_kwargs['_with_completeness'] = True
                 try:
                     profile_loaded = _load_cli_sessions_uncached(
-                        ctx_home,
-                        ctx_db_path,
-                        ctx_profile,
-                        source_filter=None,
-                        visible_session_limit=None,
-                        project_assigned_limit=PROJECT_ASSIGNED_CLI_LIMIT,
-                        cron_project_limit=None,
-                        webhook_project_limit=None,
-                        kanban_project_limit=None,
-                        include_claude_code=False,
+                        ctx_home, ctx_db_path, ctx_profile, **load_kwargs,
                     )
-                except (OSError, sqlite3.Error):
-                    logger.debug(
-                        "CLI sessions warm skipped profile %s", ctx_profile,
-                        exc_info=True,
+                except (OSError, sqlite3.Error) as _profile_err:
+                    unavailable_error = _profile_err
+                    logger.warning(
+                        "CLI sessions warm skipped unavailable profile %s at %s: %s",
+                        ctx_profile or 'default', ctx_db_path, _profile_err,
                     )
                     continue
                 if isinstance(profile_loaded, _CliSessionsLoadResult):
                     merged.extend(profile_loaded.sessions)
+                    optional_incomplete = optional_incomplete or (
+                        not profile_loaded.complete
+                        and profile_loaded.fresh_when_incomplete
+                    )
                 else:
                     merged.extend(profile_loaded)
+                successful_profiles += 1
+            external_complete = True
             try:
                 merged.extend(get_claude_code_sessions())
-            except Exception:
-                logger.debug("CLI sessions warm Claude Code scan failed", exc_info=True)
-            return merged
+            except Exception as _claude_err:
+                external_complete = False
+                logger.warning(
+                    "CLI sessions warm Claude Code scan failed: %s", _claude_err,
+                )
+            # Same completeness accounting as ``get_cli_sessions``: an
+            # incomplete aggregate must never be published as authoritative,
+            # or a profile that was merely unavailable would look like a
+            # profile that owns no sessions.
+            return _CliSessionsLoadResult(
+                merged,
+                complete=(
+                    unavailable_error is None
+                    and successful_profiles == len(contexts)
+                    and external_complete
+                    and not optional_incomplete
+                ),
+                fresh_when_incomplete=(
+                    optional_incomplete
+                    and unavailable_error is None
+                    and successful_profiles == len(contexts)
+                    and external_complete
+                ),
+            )
 
         return cache_key, _load_all
     _home, _db, _profile, cache_key = _resolve_cli_sessions_context(
         None, include_claude_code=True,
     )
 
-    def _load_one() -> list:
-        loaded = _load_cli_sessions_uncached(
-            _home,
-            _db,
-            _profile,
-            source_filter=None,
-            include_claude_code=True,
+    def _load_one():
+        load_kwargs: dict = {'source_filter': None, 'include_claude_code': True}
+        if _callable_accepts_keyword(_load_cli_sessions_uncached, '_with_completeness'):
+            load_kwargs['_with_completeness'] = True
+        # Return the loader's own result (list or ``_CliSessionsLoadResult``) so
+        # ``_load_and_cache_cli_sessions`` keeps the producer's completeness
+        # handling: an incomplete projection is served, never published.
+        return _load_cli_sessions_uncached(
+            _home, _db, _profile, **load_kwargs,
         )
-        if isinstance(loaded, _CliSessionsLoadResult):
-            return loaded.sessions
-        return loaded
 
     return cache_key, _load_one
 
