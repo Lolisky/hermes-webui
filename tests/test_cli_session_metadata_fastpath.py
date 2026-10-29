@@ -421,3 +421,54 @@ def test_hint_identity_follows_the_active_profile(stubbed_catalog, monkeypatch):
     )
     assert models.lookup_cli_session_row(target) == {}
     assert enumerated == [1]
+
+
+# ── Review round 2 (co-review): enumeration-compatible edges ──────────────
+
+
+def test_lookup_keeps_the_enumerators_exact_id_comparison(stubbed_catalog):
+    """Ids must compare exactly as the enumeration compares them.
+
+    ``_lookup_cli_session_metadata`` compares ``row["session_id"] == session_id``
+    with no normalisation, so a padded string or a non-string id is a miss
+    there. Normalising here would make the fast path answer ids the enumeration
+    never matches.
+    """
+    models.get_cli_sessions()  # prime
+    for sid in (" cli-fastpath-a ", "CLI-FASTPATH-A", 123, "", None):
+        assert models.lookup_cli_session_row(sid) == {}, sid
+
+
+def test_warm_joins_the_producers_single_flight(stubbed_catalog, monkeypatch):
+    """A warm that starts during a request's projection must not stack a second one.
+
+    The warm exists to move the cold projection off the request path; if it
+    bypassed ``_cli_sessions_cache_claim_rebuild`` it would instead run a
+    *second* projection alongside the one already in flight.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    real_load = models._load_cli_sessions_uncached
+    calls = []
+
+    def _blocked(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        assert release.wait(10)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _blocked)
+    try:
+        assert models.warm_cli_sessions_cache_async() is True
+        assert entered.wait(10)
+        # The warm is inside the producer's single-flight claim.
+        assert models._CLI_SESSIONS_CACHE_INFLIGHT, "warm bypassed single-flight"
+        # A second warm coalesces on the warm token instead of queueing another.
+        assert models.warm_cli_sessions_cache_async() is False
+    finally:
+        release.set()
+        for _ in range(100):
+            if not models._CLI_SESSIONS_WARM_INFLIGHT:
+                break
+            threading.Event().wait(0.05)
+    assert len(calls) == 1

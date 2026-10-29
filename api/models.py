@@ -10174,14 +10174,15 @@ def warm_cli_sessions_cache_async(*, all_profiles: bool = False) -> bool:
             )
             if cache_key is None:
                 return
-            stamp = _cli_sessions_cache_invalidation_stamp()
-            _load_and_cache_cli_sessions(
+            # Route through the producer's single-flight so a warm that starts
+            # while a request is already projecting joins that projection
+            # instead of stacking a second one on the same cold cache.
+            _reload_cli_sessions_after_inflight(
                 cache_key=cache_key,
                 ttl=_cli_sessions_cache_ttl_seconds(),
-                invalidation_stamp=stamp,
-                load_sessions=load_sessions,
                 stale_sessions=None,
                 stale_stamp=None,
+                load_sessions=load_sessions,
                 all_profiles=all_profiles,
                 db_path='warm',
             )
@@ -10263,7 +10264,9 @@ def lookup_cli_session_row(
     bravo request; the authoritative read is identity-scoped by construction.
     Returned rows are defensive copies, as the established cache API does.
     """
-    sid = str(session_id or '').strip()
+    # Compare exactly as the enumeration does: no stripping or coercion, so
+    # ``" sid "`` and ``123`` stay misses here just as they are there.
+    sid = session_id
     if not sid:
         return {}
     for _fresh, _expires_at, sessions in _cli_sessions_hint_candidates(

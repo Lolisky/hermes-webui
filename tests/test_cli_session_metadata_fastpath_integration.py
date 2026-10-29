@@ -405,3 +405,77 @@ def test_warm_does_not_publish_an_incomplete_aggregate(profiles, monkeypatch):
         assert key not in models._CLI_SESSIONS_CACHE, (
             "an incomplete aggregate was published as authoritative"
         )
+
+
+# ── 8. Enumeration-equivalence edges, pinned ─────────────────────────────
+
+
+def test_recency_eviction_is_not_undone_by_the_confirmation_read(profiles):
+    """A session evicted from the recency window must stay absent.
+
+    The bounded confirmation read (``get_cli_session_by_id``) is subject to
+    the *same* window as the enumeration, so a hint cannot resurrect a row the
+    sidebar no longer shows. This pins that the fast path inherits the
+    producer's window rather than widening it.
+    """
+    state, homes = profiles
+    db = homes["alpha"] / "state.db"
+    _make_state_db(db, [("old-one", "cli", "Old one")])
+
+    models.get_cli_sessions()  # prime while it is still in the window
+    assert models.lookup_cli_session_row("old-one")["session_id"] == "old-one"
+
+    # Many newer sessions push it out of the bounded window; the row itself
+    # still exists in state.db.
+    conn = sqlite3.connect(str(db))
+    try:
+        for i in range(40):
+            started = 1781024055.0 + 100 + i
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(id, source, model, message_count, started_at, title, cwd) "
+                "VALUES (?, 'cli', 'test-model', 2, ?, ?, '/tmp')",
+                (f"new-{i:02d}", started, f"New {i}"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, 'user', 'hi', ?)",
+                (f"new-{i:02d}", started),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    enumerated = {r["session_id"] for r in models.get_cli_sessions()}
+    assert "old-one" not in enumerated, "window should have evicted it"
+    # The fast path agrees with the enumeration instead of resurrecting it.
+    assert models.lookup_cli_session_row("old-one") == {}
+
+
+def test_streaming_transition_keeps_serving_the_confirmed_row(profiles, monkeypatch):
+    """The last-known-good hint survives a streaming-marker transition.
+
+    ``_cli_sessions_stable_cache_identity`` deliberately drops the volatile
+    marker, so the snapshot stays reachable while a turn streams. The row is
+    still confirmed against the live store, so surviving the transition cannot
+    make it stale — it only avoids re-projecting mid-stream (#4842).
+    """
+    state, homes = profiles
+    _make_state_db(homes["alpha"] / "state.db", [("mid-turn", "cli", "Mid turn")])
+
+    models.get_cli_sessions()
+    marker = ("streaming", ("turn-1",))
+    monkeypatch.setattr(
+        models, "_cli_sessions_streaming_freeze_marker", lambda: marker
+    )
+    # The key changed (the marker is now part of it), yet the confirmed row
+    # still answers.
+    assert models.lookup_cli_session_row("mid-turn")["session_id"] == "mid-turn"
+    # And the content is the producer's, not the snapshot's.
+    conn = sqlite3.connect(str(homes["alpha"] / "state.db"))
+    try:
+        conn.execute("UPDATE sessions SET title = 'Renamed mid-turn' WHERE id = 'mid-turn'")
+        conn.commit()
+    finally:
+        conn.close()
+    assert models.lookup_cli_session_row("mid-turn")["title"] == "Renamed mid-turn"
