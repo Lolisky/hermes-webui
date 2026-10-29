@@ -522,3 +522,82 @@ def test_warm_joins_the_producers_single_flight(stubbed_catalog, monkeypatch):
                 break
             threading.Event().wait(0.05)
     assert len(calls) == 1
+
+
+# ── Review round 3 (co-review): a frozen key does not prove membership ─────
+
+
+def _freeze(models, marker):
+    models._cli_sessions_streaming_freeze_marker = lambda: marker
+
+
+def test_expired_frozen_snapshot_defers_to_the_enumeration(stubbed_catalog, monkeypatch):
+    """A frozen key hides writes, so past its freshness window it proves nothing.
+
+    Under the streaming freeze (#4842) the producer's key stops tracking
+    state.db for the length of a turn. Two snapshots can therefore share that
+    key without describing the same catalog, so once the entry is expired the
+    producer would have re-projected — and so must the lookup.
+    """
+    monkeypatch.setattr(
+        models, "_cli_sessions_streaming_freeze_marker", lambda: ("streaming", ("t1",))
+    )
+    models.clear_cli_sessions_cache()
+    assert models.get_cli_sessions()  # prime under the frozen key
+
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        for key in list(models._CLI_SESSIONS_CACHE):
+            entry = models._CLI_SESSIONS_CACHE[key]
+            models._CLI_SESSIONS_CACHE[key] = (0.0, entry[1], entry[2])
+
+    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
+    enumerations = []
+    monkeypatch.setattr(
+        models, "get_cli_sessions", lambda *a, **kw: enumerations.append(1) or []
+    )
+    assert models.lookup_cli_session_row(ROWS[0]["session_id"]) == {}
+    assert enumerations == [1]
+
+
+def test_fresh_frozen_snapshot_still_answers(stubbed_catalog, monkeypatch):
+    """Within its freshness window a frozen snapshot is what the producer serves."""
+    monkeypatch.setattr(
+        models, "_cli_sessions_streaming_freeze_marker", lambda: ("streaming", ("t1",))
+    )
+    models.clear_cli_sessions_cache()
+    assert models.get_cli_sessions()  # prime under the frozen key
+
+    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
+    enumerations = []
+    monkeypatch.setattr(
+        models, "get_cli_sessions", lambda *a, **kw: enumerations.append(1) or []
+    )
+    assert models.lookup_cli_session_row(ROWS[0]["session_id"])["session_id"] == (
+        ROWS[0]["session_id"]
+    )
+    assert enumerations == []
+
+
+def test_frozen_last_known_good_never_proves_membership(stubbed_catalog, monkeypatch):
+    """The TTL-less last-known-good map may not be used under a frozen key.
+
+    A frozen entry there can be arbitrarily old — even from an earlier
+    streaming episode with the same active-stream set.
+    """
+    monkeypatch.setattr(
+        models, "_cli_sessions_streaming_freeze_marker", lambda: ("streaming", ("t1",))
+    )
+    models.clear_cli_sessions_cache()
+    assert models.get_cli_sessions()  # prime: primary + LKG, both frozen
+
+    # Drop the primary so only the LKG could answer.
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        models._CLI_SESSIONS_CACHE.clear()
+
+    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
+    enumerations = []
+    monkeypatch.setattr(
+        models, "get_cli_sessions", lambda *a, **kw: enumerations.append(1) or []
+    )
+    assert models.lookup_cli_session_row(ROWS[0]["session_id"]) == {}
+    assert enumerations == [1]

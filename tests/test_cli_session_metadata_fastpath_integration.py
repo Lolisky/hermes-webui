@@ -138,6 +138,13 @@ def profiles(tmp_path, monkeypatch):
         else (tmp_path / "profiles" / str(name)),
     )
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", index_path)
+    # The project catalog is an input to the projection (project_id resolution
+    # and the assigned-recovery pass), so the fast path's identity has to see
+    # it too. Point it at a temp file and start it empty.
+    projects_file = tmp_path / "projects.json"
+    projects_file.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(models, "PROJECTS_FILE", projects_file)
+    monkeypatch.setattr(models, "_projects_migrated", True)
     # No Claude Code scan: it is global rather than profile-owned and would add
     # rows from the host's real ~/.claude to every assertion here.
     monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
@@ -459,26 +466,38 @@ def test_recency_eviction_is_not_undone_by_the_confirmation_read(profiles):
     assert "old-one" not in {r["session_id"] for r in models.get_cli_sessions()}
 
 
-def test_streaming_transition_keeps_serving_the_confirmed_row(profiles, monkeypatch):
-    """The last-known-good hint survives a streaming-marker transition.
+def test_streaming_transition_re_enumerates_instead_of_reusing_the_idle_hint(
+    profiles, monkeypatch
+):
+    """A marker transition must not reuse the idle snapshot.
 
-    ``_cli_sessions_stable_cache_identity`` deliberately drops the volatile
-    marker, so the snapshot stays reachable while a turn streams. The row is
-    still confirmed against the live store, so surviving the transition cannot
-    make it stale — it only avoids re-projecting mid-stream (#4842).
+    The marker is part of the volatile identity, so the snapshot taken while
+    idle does not describe the frozen catalog — and a frozen snapshot does not
+    describe the idle one. Either way the lookup must re-enumerate rather than
+    answer from the previous mode's rows. (Inside a single frozen episode the
+    fresh primary may answer; that is pinned separately.)
     """
     state, homes = profiles
     _make_state_db(homes["alpha"] / "state.db", [("mid-turn", "cli", "Mid turn")])
 
-    models.get_cli_sessions()
-    marker = ("streaming", ("turn-1",))
+    models.get_cli_sessions()  # prime while idle
     monkeypatch.setattr(
-        models, "_cli_sessions_streaming_freeze_marker", lambda: marker
+        models, "_cli_sessions_streaming_freeze_marker", lambda: ("streaming", ("turn-1",))
     )
-    # The key changed (the marker is now part of it), yet the confirmed row
-    # still answers.
+
+    loads = []
+    real_load = models._load_cli_sessions_uncached
+
+    def _counting(*args, **kwargs):
+        loads.append(kwargs.get("session_ids"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
+
     assert models.lookup_cli_session_row("mid-turn")["session_id"] == "mid-turn"
-    # And the content is the producer's, not the snapshot's.
+    assert None in loads, f"the idle snapshot was reused across the transition: {loads}"
+
+    # Content still comes from the producer, not from any snapshot.
     conn = sqlite3.connect(str(homes["alpha"] / "state.db"))
     try:
         conn.execute("UPDATE sessions SET title = 'Renamed mid-turn' WHERE id = 'mid-turn'")
@@ -586,3 +605,98 @@ def test_changed_revision_falls_back_to_the_enumeration(profiles, monkeypatch):
     assert loads and loads[-1] is None, (
         f"expected a full enumeration, got {loads}"
     )
+
+
+# ── 10. Inputs to the projection that are not state.db ───────────────────
+
+
+def test_project_catalog_change_invalidates_the_hint(profiles, monkeypatch):
+    """A projects.json change must invalidate the snapshot.
+
+    The projection reads the project catalog to resolve each row's project_id
+    and to drive the assigned-recovery pass, so dropping a project can move a
+    session out of the window WITHOUT touching state.db. If the catalog were
+    absent from the cache identity, a hint built before the change would still
+    look current.
+    """
+    state, homes = profiles
+    _make_state_db(homes["alpha"] / "state.db", [("assigned-one", "cli", "Assigned")])
+
+    models.get_cli_sessions()  # prime with the empty catalog
+    assert models.lookup_cli_session_row("assigned-one")["session_id"] == "assigned-one"
+
+    # An external project-catalog change; state.db and the index are untouched.
+    models.PROJECTS_FILE.write_text(
+        '[{"id": "p1", "name": "P1", "profile": "alpha"}]', encoding="utf-8"
+    )
+
+    loads = []
+    real_load = models._load_cli_sessions_uncached
+
+    def _counting(*args, **kwargs):
+        loads.append(kwargs.get("session_ids"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
+
+    assert models.lookup_cli_session_row("assigned-one")["session_id"] == "assigned-one"
+    assert loads and loads[-1] is None, (
+        f"a project-catalog change must re-enumerate, got {loads}"
+    )
+
+
+def test_expired_streaming_hint_cannot_outlive_the_producer_ttl(profiles, monkeypatch):
+    """Under a frozen key, an expired snapshot must defer to the enumeration.
+
+    The streaming freeze hides state.db writes, so the key can stay the same
+    while 40 newer sessions appear. Within the producer's freshness window
+    that is exactly what it serves; past it the producer re-projects, and so
+    must the lookup.
+    """
+    state, homes = profiles
+    db = homes["alpha"] / "state.db"
+    _make_state_db(db, [("old-one", "cli", "Old one")])
+
+    marker = ("streaming", ("turn-1",))
+    monkeypatch.setattr(models, "_cli_sessions_streaming_freeze_marker", lambda: marker)
+    models.get_cli_sessions()  # prime under the frozen key
+
+    # 40 newer sessions arrive; the frozen key does not move.
+    conn = sqlite3.connect(str(db))
+    try:
+        for i in range(40):
+            started = 1781024055.0 + 100 + i
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(id, source, model, message_count, started_at, title, cwd) "
+                "VALUES (?, 'cli', 'test-model', 2, ?, ?, '/tmp')",
+                (f"new-{i:02d}", started, f"New {i}"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, 'user', 'hi', ?)",
+                (f"new-{i:02d}", started),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Expire the frozen entry without changing its key.
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        for key in list(models._CLI_SESSIONS_CACHE):
+            entry = models._CLI_SESSIONS_CACHE[key]
+            models._CLI_SESSIONS_CACHE[key] = (0.0, entry[1], entry[2])
+
+    loads = []
+    real_load = models._load_cli_sessions_uncached
+
+    def _counting(*args, **kwargs):
+        loads.append(kwargs.get("session_ids"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
+
+    assert routes._lookup_cli_session_metadata("old-one") == {}
+    # A full enumeration ran (the trailing ('old-one',) read is master's
+    # pre-existing oneshot fallback, not the hint path).
+    assert None in loads, f"expected a full enumeration, got {loads}"

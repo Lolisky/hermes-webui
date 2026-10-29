@@ -9743,6 +9743,22 @@ def _cli_sessions_volatile_cache_identity(cache_key: tuple) -> tuple:
     return (cache_key[4],) if len(cache_key) > 4 else ()
 
 
+def _cli_sessions_volatile_is_stream_frozen(volatile: tuple) -> bool:
+    """True when a volatile component is a streaming-freeze marker.
+
+    While a turn streams, the producer deliberately freezes the volatile part
+    of its cache key (#4842) so per-delta writes don't bust the projection.
+    Two snapshots taken under the same marker therefore share a key without
+    describing the same catalog: the marker only says "the producer is in the
+    same frozen mode". It proves membership only as far as the producer's own
+    freshness window goes, and never through the TTL-less last-known-good map.
+    """
+    component = volatile[0] if volatile else None
+    if not isinstance(component, tuple) or not component:
+        return False
+    return component[0] in ('streaming', 'streaming-frozen')
+
+
 def _copy_last_known_good_cli_sessions(stable_key: tuple, invalidation_stamp: int):
     with _CLI_SESSIONS_CACHE_LOCK:
         entry = _CLI_SESSIONS_LAST_KNOWN_GOOD.get(stable_key)
@@ -10003,6 +10019,9 @@ def _cli_sessions_hint_candidates(*, all_profiles: bool) -> list:
     with _CLI_SESSIONS_CACHE_LOCK:
         primary = _CLI_SESSIONS_CACHE.get(full_key)
         if primary is not None:
+            expires_at = 0.0
+            entry_stamp = None
+            sessions = None
             try:
                 if len(primary) == 3:
                     expires_at, entry_stamp, sessions = primary
@@ -10012,7 +10031,12 @@ def _cli_sessions_hint_candidates(*, all_profiles: bool) -> list:
             except Exception:
                 sessions = None
             if sessions is not None and entry_stamp == stamp_now:
-                candidates.append((bool(expires_at > now), expires_at, sessions))
+                # A stream-frozen key hides state.db writes, so an EXPIRED
+                # frozen snapshot describes a catalog the producer itself would
+                # have re-projected by now. Within its freshness window it is
+                # exactly what the producer serves, so it may still answer.
+                if expires_at > now or not _cli_sessions_volatile_is_stream_frozen(volatile_now):
+                    candidates.append((bool(expires_at > now), expires_at, sessions))
         lkg = _CLI_SESSIONS_LAST_KNOWN_GOOD.get(stable_key)
         if lkg is not None:
             entry_stamp = None
@@ -10027,6 +10051,11 @@ def _cli_sessions_hint_candidates(*, all_profiles: bool) -> list:
                 sessions is not None
                 and entry_stamp == stamp_now
                 and entry_volatile == volatile_now
+                # Last-known-good carries no TTL, so a frozen-volatile entry
+                # can be arbitrarily old (even from an earlier streaming
+                # episode with the same active-stream set). It may never prove
+                # membership.
+                and not _cli_sessions_volatile_is_stream_frozen(volatile_now)
             ):
                 candidates.append((False, 0.0, sessions))
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -10059,6 +10088,11 @@ def _all_profiles_cli_cache_key(contexts, context_cache_key, source_filter, incl
         _path_cache_key(_default_claude_code_projects_dir()),
         _path_stat_cache_key(_default_claude_code_projects_dir()),
         _path_stat_cache_key(SESSION_INDEX_FILE),
+        # The project catalog is an input to the projection, not just a label:
+        # it resolves each row's project_id and drives the assigned-recovery
+        # pass. Dropping a project can move a session out of the window without
+        # touching state.db, so it has to participate in the identity.
+        _path_stat_cache_key(PROJECTS_FILE),
     )
 
 
@@ -10537,6 +10571,10 @@ def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool 
         _path_cache_key(projects_dir),
         _path_stat_cache_key(projects_dir),
         _path_stat_cache_key(SESSION_INDEX_FILE),
+        # See ``_all_profiles_cli_cache_key``: the project catalog is an input
+        # to the projection (project_id resolution and the assigned-recovery
+        # pass), so a change there must invalidate the snapshot.
+        _path_stat_cache_key(PROJECTS_FILE),
     )
     return hermes_home, db_path, cli_profile, cache_key
 
