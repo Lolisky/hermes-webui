@@ -1,17 +1,14 @@
-"""#8412 review: real-producer/consumer regressions for the metadata fast path.
+"""#8412: real-producer/consumer regressions for the metadata fast path.
 
-The unit tests in ``test_cli_session_metadata_fastpath.py`` stub the catalog
-loader, which the reviewer correctly noted can miss the transitions that matter
-("the submitted four tests pass but mock the loader and miss these
-transitions"). These tests instead use:
+The unit tests stub the catalog loader, which the reviewer correctly noted can
+miss the transitions that matter. These use:
 
-* **real SQLite profile databases** (two of them, so cross-profile scope is
-  exercised against actual files, not a boolean),
+* **real SQLite profile databases** (two, so cross-profile scope is exercised
+  against actual files, not a boolean),
 * the **real catalog/cache producer** ``get_cli_sessions()`` with its real
-  cache-key construction and last-known-good map,
-* the **real request-profile binding** (``api.profiles.get_active_hermes_home``
-  / ``get_active_profile_name``, which ``_resolve_cli_sessions_context``
-  imports at call time), and
+  cache-key construction,
+* the **real request-profile binding** (``api.profiles`` helpers, which
+  ``_resolve_cli_sessions_context`` imports at call time), and
 * the **real route consumer** ``_lookup_cli_session_metadata``.
 
 No loader is mocked. Every assertion compares the fast path against what the
@@ -106,6 +103,28 @@ def _make_state_db(path: Path, rows) -> None:
         conn.close()
 
 
+def _add_newer_sessions(path: Path, count: int = 40, prefix: str = "new") -> None:
+    """Push ``count`` newer sessions into a state.db (advances the revision)."""
+    conn = sqlite3.connect(str(path))
+    try:
+        for i in range(count):
+            started = 1781024055.0 + 100 + i
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(id, source, model, message_count, started_at, title, cwd) "
+                "VALUES (?, 'cli', 'test-model', 2, ?, ?, '/tmp')",
+                (f"{prefix}-{i:02d}", started, f"New {i}"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, 'user', 'hi', ?)",
+                (f"{prefix}-{i:02d}", started),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def profiles(tmp_path, monkeypatch):
     """Two real profiles on disk, with the active one switchable mid-test."""
@@ -139,8 +158,7 @@ def profiles(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", index_path)
     # The project catalog is an input to the projection (project_id resolution
-    # and the assigned-recovery pass), so the fast path's identity has to see
-    # it too. Point it at a temp file and start it empty.
+    # and the assigned-recovery pass), so the identity has to see it too.
     projects_file = tmp_path / "projects.json"
     projects_file.write_text("[]", encoding="utf-8")
     monkeypatch.setattr(models, "PROJECTS_FILE", projects_file)
@@ -159,22 +177,33 @@ def _switch(state, name):
     state["active"] = name
 
 
+def _count_loads(monkeypatch):
+    """Record the ``session_ids`` argument of every catalog read."""
+    loads = []
+    real_load = models._load_cli_sessions_uncached
+
+    def _counting(*args, **kwargs):
+        loads.append(kwargs.get("session_ids"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
+    return loads
+
+
 # ── 1. A→B: one profile's snapshot must not answer another profile ─────────
 
 
 def test_primed_profile_does_not_answer_a_switch(profiles):
-    """Prime alpha's catalog, switch to bravo: alpha-only SID must miss."""
+    """Prime alpha's catalog, switch to bravo: an alpha-only SID must miss."""
     state, homes = profiles
     _make_state_db(homes["alpha"] / "state.db", [("alpha-only", "cli", "Alpha only")])
     _make_state_db(homes["bravo"] / "state.db", [("bravo-only", "cli", "Bravo only")])
 
-    # Prime through the real producer under alpha.
     assert [r["session_id"] for r in models.get_cli_sessions()] == ["alpha-only"]
     assert models.lookup_cli_session_row("alpha-only")["session_id"] == "alpha-only"
 
     _switch(state, "bravo")
 
-    # The route consumer must agree with the enumeration for bravo's scope.
     enumerated = {r["session_id"] for r in models.get_cli_sessions()}
     assert enumerated == {"bravo-only"}
     assert models.lookup_cli_session_row("alpha-only") == {}
@@ -193,8 +222,6 @@ def test_same_sid_in_both_profiles_resolves_to_the_active_one(profiles):
 
     _switch(state, "bravo")
 
-    # Master returns bravo's row here; the fast path must not keep serving
-    # alpha's title, and must not report a profile mismatch for its own scope.
     assert models.get_cli_sessions()[0]["title"] == "Bravo title"
     assert models.lookup_cli_session_row("shared-sid")["title"] == "Bravo title"
     meta = routes._lookup_cli_session_metadata("shared-sid")
@@ -202,31 +229,11 @@ def test_same_sid_in_both_profiles_resolves_to_the_active_one(profiles):
     assert meta["profile"] == "bravo"
 
 
-# ── 2. Primary eviction → last-known-good must still be scoped ─────────────
-
-
-def test_primary_eviction_keeps_the_last_known_good_hint_scoped(profiles):
-    """Evicting the primary cache must not let LKG answer a foreign scope."""
-    state, homes = profiles
-    _make_state_db(homes["alpha"] / "state.db", [("alpha-only", "cli", "Alpha only")])
-    _make_state_db(homes["bravo"] / "state.db", [("bravo-only", "cli", "Bravo only")])
-
-    models.get_cli_sessions()  # prime alpha: primary + LKG
-    with models._CLI_SESSIONS_CACHE_LOCK:
-        models._CLI_SESSIONS_CACHE.clear()  # what a fingerprint churn looks like
-    # The LKG entry for alpha survives; it must still answer alpha.
-    assert models.lookup_cli_session_row("alpha-only")["session_id"] == "alpha-only"
-
-    _switch(state, "bravo")
-    # bravo has its own LKG only after it projects; alpha's must not be reachable.
-    assert models.lookup_cli_session_row("alpha-only") == {}
-
-
-# ── 3. External writes: delete and title update ────────────────────────────
+# ── 2. External writes ───────────────────────────────────────────────────
 
 
 def test_external_delete_is_not_served_from_the_snapshot(profiles):
-    """A row deleted by another process must not keep answering 200."""
+    """A row deleted by another process must not keep answering."""
     state, homes = profiles
     db = homes["alpha"] / "state.db"
     _make_state_db(db, [("victim", "cli", "Victim"), ("keeper", "cli", "Keeper")])
@@ -234,7 +241,6 @@ def test_external_delete_is_not_served_from_the_snapshot(profiles):
     models.get_cli_sessions()  # prime
     assert models.lookup_cli_session_row("victim")["session_id"] == "victim"
 
-    # An external CLI deletes the session (no in-process cache clear).
     conn = sqlite3.connect(str(db))
     try:
         conn.execute("DELETE FROM messages WHERE session_id = 'victim'")
@@ -243,7 +249,6 @@ def test_external_delete_is_not_served_from_the_snapshot(profiles):
     finally:
         conn.close()
 
-    # The bounded confirm read sees the truth; the enumeration agrees.
     assert models.lookup_cli_session_row("victim") == {}
     assert "victim" not in {r["session_id"] for r in models.get_cli_sessions()}
 
@@ -264,10 +269,12 @@ def test_external_title_update_reaches_the_caller(profiles):
     finally:
         conn.close()
 
-    assert models.lookup_cli_session_row("rename-me")["title"] == "New title"
+    # The write moved the revision, so the probe defers and the route's
+    # enumeration supplies the new title.
+    assert routes._lookup_cli_session_metadata("rename-me")["title"] == "New title"
 
 
-# ── 4. Negative → new insert, and explicit invalidation ───────────────────
+# ── 3. Negative → new insert, and explicit invalidation ──────────────────
 
 
 def test_new_insert_after_a_negative_lookup_is_found(profiles):
@@ -278,8 +285,6 @@ def test_new_insert_after_a_negative_lookup_is_found(profiles):
 
     assert models.lookup_cli_session_row("late-arrival") == {}
 
-    # The agent inserts a new session; its write churns the state.db fingerprint
-    # (the fingerprint is derived from message rows, as in a real turn).
     conn = sqlite3.connect(str(db))
     try:
         conn.execute(
@@ -294,11 +299,13 @@ def test_new_insert_after_a_negative_lookup_is_found(profiles):
     finally:
         conn.close()
 
-    assert models.lookup_cli_session_row("late-arrival")["session_id"] == "late-arrival"
+    assert routes._lookup_cli_session_metadata("late-arrival")["session_id"] == (
+        "late-arrival"
+    )
 
 
 def test_explicit_invalidation_drops_every_hint(profiles):
-    """``clear_cli_sessions_cache()`` must leave no hint reachable."""
+    """``clear_cli_sessions_cache()`` must leave no snapshot reachable."""
     state, homes = profiles
     _make_state_db(homes["alpha"] / "state.db", [("keep-me", "cli", "Keep")])
 
@@ -310,11 +317,11 @@ def test_explicit_invalidation_drops_every_hint(profiles):
         assert not models._CLI_SESSIONS_CACHE
         assert not models._CLI_SESSIONS_LAST_KNOWN_GOOD
 
-    # Still correct — answered by a fresh enumeration, not a stale hint.
-    assert models.lookup_cli_session_row("keep-me")["session_id"] == "keep-me"
+    # Still correct — answered by a fresh enumeration, not a stale snapshot.
+    assert routes._lookup_cli_session_metadata("keep-me")["session_id"] == "keep-me"
 
 
-# ── 5. Aggregate ordering with a duplicate SID ────────────────────────────
+# ── 4. Aggregate ordering and owner ─────────────────────────────────────
 
 
 def test_all_profiles_duplicate_sid_uses_enumeration_order(profiles):
@@ -331,204 +338,42 @@ def test_all_profiles_duplicate_sid_uses_enumeration_order(profiles):
     assert got["title"] == first["title"]
 
 
-# ── 6. Startup warm → named-profile lookup ────────────────────────────────
+def test_aggregate_does_not_substitute_an_earlier_profiles_out_of_window_row(profiles):
+    """The confirmation read must not swap the aggregate's owner.
 
-
-def test_startup_warm_then_named_profile_lookup(profiles):
-    """The startup warm primes the ACTIVE identity; a later switch must not
-    inherit it, and must not be blocked by it."""
-    import threading
-
-    state, homes = profiles
-    _make_state_db(homes["alpha"] / "state.db", [("alpha-only", "cli", "Alpha only")])
-    _make_state_db(homes["bravo"] / "state.db", [("bravo-only", "cli", "Bravo only")])
-
-    done = threading.Event()
-    real_load = models._load_and_cache_cli_sessions
-
-    def _watchful(*args, **kwargs):
-        try:
-            return real_load(*args, **kwargs)
-        finally:
-            done.set()
-
-    original = models._load_and_cache_cli_sessions
-    models._load_and_cache_cli_sessions = _watchful
-    try:
-        assert models.warm_cli_sessions_cache_async() is True
-        assert done.wait(15), "startup warm did not run"
-    finally:
-        models._load_and_cache_cli_sessions = original
-
-    # The warm landed on the identity the first lookup resolves.
-    assert models.lookup_cli_session_row("alpha-only")["session_id"] == "alpha-only"
-
-    _switch(state, "bravo")
-    assert models.lookup_cli_session_row("alpha-only") == {}
-    assert models.lookup_cli_session_row("bravo-only")["session_id"] == "bravo-only"
-
-
-# ── 7. An incomplete aggregate must never be published ────────────────────
-
-
-def test_warm_does_not_publish_an_incomplete_aggregate(profiles, monkeypatch):
-    """If one profile is unavailable, the warm must serve but not cache it.
-
-    ``_load_and_cache_cli_sessions`` treats a plain list as complete, so the
-    warm's aggregate has to carry the producer's completeness accounting —
-    otherwise a profile that was merely unreadable is published as a profile
-    that owns no sessions, and every hint built from it is a lie.
+    Same SID in both profiles, but alpha's copy has been pushed out of alpha's
+    own window by newer sessions while bravo's copy is still in bravo's. The
+    aggregate enumeration therefore answers with bravo's row; the bounded
+    reader resolves per profile in aggregate order and would hand back alpha's
+    out-of-window row — a different owner, not a confirmation.
     """
     state, homes = profiles
-    _make_state_db(homes["alpha"] / "state.db", [("alpha-only", "cli", "Alpha only")])
-    _make_state_db(homes["bravo"] / "state.db", [("bravo-only", "cli", "Bravo only")])
+    _make_state_db(homes["alpha"] / "state.db", [("shared", "cli", "Alpha copy")])
+    _make_state_db(homes["bravo"] / "state.db", [("shared", "cli", "Bravo copy")])
+    _add_newer_sessions(homes["alpha"] / "state.db", prefix="alpha-new")
 
-    real_loader = models._load_cli_sessions_uncached
+    enumerated = models.get_cli_sessions(all_profiles=True)
+    owner = next(r for r in enumerated if r["session_id"] == "shared")
+    assert owner["profile"] == "bravo", "bravo should own the aggregate row"
 
-    def _flaky(home, db_path, profile, **kwargs):
-        if str(profile) == "bravo":
-            raise sqlite3.OperationalError("database is locked")
-        return real_loader(home, db_path, profile, **kwargs)
-
-    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _flaky)
-
-    key, load = models._cli_sessions_lookup_identity(all_profiles=True)
-    result = load()
-    assert isinstance(result, models._CliSessionsLoadResult)
-    assert result.complete is False, "one profile was unreadable"
-
-    models.clear_cli_sessions_cache()
-    models._load_and_cache_cli_sessions(
-        cache_key=key,
-        ttl=models._cli_sessions_cache_ttl_seconds(),
-        invalidation_stamp=models._cli_sessions_cache_invalidation_stamp(),
-        load_sessions=load,
-        stale_sessions=None,
-        stale_stamp=None,
-        all_profiles=True,
-        db_path="all profiles",
-    )
-    with models._CLI_SESSIONS_CACHE_LOCK:
-        assert key not in models._CLI_SESSIONS_CACHE, (
-            "an incomplete aggregate was published as authoritative"
-        )
+    # With alpha's window over-full the producer serves but does not publish
+    # that projection, so the answer comes from the enumeration — which is
+    # exactly where the owner is decided.
+    got = routes._lookup_cli_session_metadata("shared", all_profiles=True)
+    assert got["profile"] == owner["profile"]
+    assert got["title"] == owner["title"]
 
 
-# ── 8. Enumeration-equivalence edges, pinned ─────────────────────────────
-
-
-def test_recency_eviction_is_not_undone_by_the_confirmation_read(profiles):
-    """A session evicted from the catalog window must stay absent.
-
-    ``get_cli_session_by_id`` deliberately resolves explicit opens *outside*
-    any recency window (#8265), so a source-scoped confirmation is not a
-    catalog-membership check. The fast path must therefore prove membership
-    itself: when the snapshot no longer describes the current catalog it has
-    to defer to the enumeration, which is the only thing that knows the
-    window.
-
-    The lookup happens BEFORE any re-enumeration on purpose: enumerating first
-    would replace the snapshot and hide the stale-hint schedule entirely.
-    """
-    state, homes = profiles
-    db = homes["alpha"] / "state.db"
-    _make_state_db(db, [("old-one", "cli", "Old one")])
-
-    models.get_cli_sessions()  # prime while it is still in the window
-    # Positive control: while it is in the window the fast path answers.
-    assert models.lookup_cli_session_row("old-one")["session_id"] == "old-one"
-
-    # Many newer sessions push it out of the bounded window; the row itself
-    # still exists in state.db.
-    conn = sqlite3.connect(str(db))
-    try:
-        for i in range(40):
-            started = 1781024055.0 + 100 + i
-            conn.execute(
-                "INSERT OR REPLACE INTO sessions "
-                "(id, source, model, message_count, started_at, title, cwd) "
-                "VALUES (?, 'cli', 'test-model', 2, ?, ?, '/tmp')",
-                (f"new-{i:02d}", started, f"New {i}"),
-            )
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) "
-                "VALUES (?, 'user', 'hi', ?)",
-                (f"new-{i:02d}", started),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-    # Look up through the consumer BEFORE anything re-enumerates.
-    assert routes._lookup_cli_session_metadata("old-one") == {}
-
-    # And the enumeration it deferred to agrees.
-    assert "old-one" not in {r["session_id"] for r in models.get_cli_sessions()}
-
-
-def test_streaming_transition_re_enumerates_instead_of_reusing_the_idle_hint(
-    profiles, monkeypatch
-):
-    """A marker transition must not reuse the idle snapshot.
-
-    The marker is part of the volatile identity, so the snapshot taken while
-    idle does not describe the frozen catalog — and a frozen snapshot does not
-    describe the idle one. Either way the lookup must re-enumerate rather than
-    answer from the previous mode's rows. (Inside a single frozen episode the
-    fresh primary may answer; that is pinned separately.)
-    """
-    state, homes = profiles
-    _make_state_db(homes["alpha"] / "state.db", [("mid-turn", "cli", "Mid turn")])
-
-    models.get_cli_sessions()  # prime while idle
-    monkeypatch.setattr(
-        models, "_cli_sessions_streaming_freeze_marker", lambda: ("streaming", ("turn-1",))
-    )
-
-    loads = []
-    real_load = models._load_cli_sessions_uncached
-
-    def _counting(*args, **kwargs):
-        loads.append(kwargs.get("session_ids"))
-        return real_load(*args, **kwargs)
-
-    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
-
-    assert models.lookup_cli_session_row("mid-turn")["session_id"] == "mid-turn"
-    assert None in loads, f"the idle snapshot was reused across the transition: {loads}"
-
-    # Content still comes from the producer, not from any snapshot.
-    conn = sqlite3.connect(str(homes["alpha"] / "state.db"))
-    try:
-        conn.execute("UPDATE sessions SET title = 'Renamed mid-turn' WHERE id = 'mid-turn'")
-        conn.commit()
-    finally:
-        conn.close()
-    assert models.lookup_cli_session_row("mid-turn")["title"] == "Renamed mid-turn"
-
-
-# ── 9. The optimisation itself, proven on a real store ───────────────────
+# ── 5. The optimisation itself, proven on a real store ───────────────────
 
 
 def test_current_snapshot_answers_without_reprojecting(profiles, monkeypatch):
-    """A lookup against an unchanged catalog must not re-run the projection.
-
-    This is the whole point of the change, asserted against a real state.db:
-    the snapshot describes the current revision, so membership is proven and
-    the answer comes from the snapshot plus one bounded read.
-    """
+    """A lookup against an unchanged catalog must not re-run the projection."""
     state, homes = profiles
     _make_state_db(homes["alpha"] / "state.db", [("live-one", "cli", "Live one")])
 
     models.get_cli_sessions()  # prime
-    loads = []
-    real_load = models._load_cli_sessions_uncached
-
-    def _counting(*args, **kwargs):
-        loads.append(kwargs.get("session_ids"))
-        return real_load(*args, **kwargs)
-
-    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
+    loads = _count_loads(monkeypatch)
 
     row = models.lookup_cli_session_row("live-one")
     assert row["session_id"] == "live-one"
@@ -537,49 +382,29 @@ def test_current_snapshot_answers_without_reprojecting(profiles, monkeypatch):
 
 
 def test_expired_but_unchanged_snapshot_still_answers(profiles, monkeypatch):
-    """TTL expiry alone must not force a re-projection.
-
-    Expiry changes freshness, not membership: the revision is unchanged, so the
-    snapshot still describes the current catalog and the bounded read confirms
-    the content.
-    """
+    """TTL expiry alone must not force a re-projection."""
     state, homes = profiles
     _make_state_db(homes["alpha"] / "state.db", [("ttl-one", "cli", "TTL one")])
 
     models.get_cli_sessions()  # prime
-    # Force every primary entry to be long-expired without touching its stamp.
     with models._CLI_SESSIONS_CACHE_LOCK:
         for key in list(models._CLI_SESSIONS_CACHE):
             entry = models._CLI_SESSIONS_CACHE[key]
             models._CLI_SESSIONS_CACHE[key] = (0.0, entry[1], entry[2])
 
-    loads = []
-    real_load = models._load_cli_sessions_uncached
-
-    def _counting(*args, **kwargs):
-        loads.append(kwargs.get("session_ids"))
-        return real_load(*args, **kwargs)
-
-    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
-
+    loads = _count_loads(monkeypatch)
     assert models.lookup_cli_session_row("ttl-one")["session_id"] == "ttl-one"
     assert loads == [("ttl-one",)], loads
 
 
 def test_changed_revision_falls_back_to_the_enumeration(profiles, monkeypatch):
-    """Once the catalog revision moves, the snapshot may not answer.
-
-    Membership cannot be proven against a different revision — the row may have
-    left the window or the store — so the lookup must defer to the enumeration
-    even though the hint still carries the row.
-    """
+    """Once the catalog revision moves, the snapshot may not answer."""
     state, homes = profiles
     db = homes["alpha"] / "state.db"
     _make_state_db(db, [("moved-one", "cli", "Moved one")])
 
     models.get_cli_sessions()  # prime at revision R1
 
-    # An unrelated write advances the revision without touching moved-one.
     conn = sqlite3.connect(str(db))
     try:
         conn.execute(
@@ -590,24 +415,14 @@ def test_changed_revision_falls_back_to_the_enumeration(profiles, monkeypatch):
     finally:
         conn.close()
 
-    loads = []
-    real_load = models._load_cli_sessions_uncached
-
-    def _counting(*args, **kwargs):
-        loads.append(kwargs.get("session_ids"))
-        return real_load(*args, **kwargs)
-
-    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
-
+    loads = _count_loads(monkeypatch)
     # The row is still there and still current — but membership is now proved
     # by the enumeration, not by the stale snapshot.
-    assert models.lookup_cli_session_row("moved-one")["session_id"] == "moved-one"
-    assert loads and loads[-1] is None, (
-        f"expected a full enumeration, got {loads}"
-    )
+    assert routes._lookup_cli_session_metadata("moved-one")["session_id"] == "moved-one"
+    assert loads and loads[-1] is None, f"expected a full enumeration, got {loads}"
 
 
-# ── 10. Inputs to the projection that are not state.db ───────────────────
+# ── 6. Inputs to the projection that are not state.db ────────────────────
 
 
 def test_project_catalog_change_invalidates_the_hint(profiles, monkeypatch):
@@ -615,9 +430,7 @@ def test_project_catalog_change_invalidates_the_hint(profiles, monkeypatch):
 
     The projection reads the project catalog to resolve each row's project_id
     and to drive the assigned-recovery pass, so dropping a project can move a
-    session out of the window WITHOUT touching state.db. If the catalog were
-    absent from the cache identity, a hint built before the change would still
-    look current.
+    session out of the window WITHOUT touching state.db.
     """
     state, homes = profiles
     _make_state_db(homes["alpha"] / "state.db", [("assigned-one", "cli", "Assigned")])
@@ -625,183 +438,107 @@ def test_project_catalog_change_invalidates_the_hint(profiles, monkeypatch):
     models.get_cli_sessions()  # prime with the empty catalog
     assert models.lookup_cli_session_row("assigned-one")["session_id"] == "assigned-one"
 
-    # An external project-catalog change; state.db and the index are untouched.
     models.PROJECTS_FILE.write_text(
         '[{"id": "p1", "name": "P1", "profile": "alpha"}]', encoding="utf-8"
     )
 
-    loads = []
-    real_load = models._load_cli_sessions_uncached
-
-    def _counting(*args, **kwargs):
-        loads.append(kwargs.get("session_ids"))
-        return real_load(*args, **kwargs)
-
-    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
-
-    assert models.lookup_cli_session_row("assigned-one")["session_id"] == "assigned-one"
+    loads = _count_loads(monkeypatch)
+    assert routes._lookup_cli_session_metadata("assigned-one")["session_id"] == (
+        "assigned-one"
+    )
     assert loads and loads[-1] is None, (
         f"a project-catalog change must re-enumerate, got {loads}"
     )
 
 
-def test_expired_streaming_hint_cannot_outlive_the_producer_ttl(profiles, monkeypatch):
-    """Under a frozen key, an expired snapshot must defer to the enumeration.
+def test_all_profiles_snapshot_is_scoped_to_the_aggregate_identity(profiles, monkeypatch):
+    """A write to a NON-active profile must invalidate the aggregate snapshot.
 
-    The streaming freeze hides state.db writes, so the key can stay the same
-    while 40 newer sessions appear. Within the producer's freshness window
-    that is exactly what it serves; past it the producer re-projects, and so
-    must the lookup.
+    The aggregate key's volatile component is the per-profile context tuple,
+    not the stable profile-home list; confusing them makes every expired
+    aggregate snapshot look current.
+    """
+    state, homes = profiles
+    _make_state_db(homes["alpha"] / "state.db", [("old-one", "cli", "Old one")])
+    _make_state_db(homes["bravo"] / "state.db", [("bravo-one", "cli", "Bravo one")])
+
+    primed = {r["session_id"] for r in models.get_cli_sessions(all_profiles=True)}
+    assert {"old-one", "bravo-one"} <= primed
+
+    _add_newer_sessions(homes["bravo"] / "state.db", prefix="bravo-new")
+
+    loads = _count_loads(monkeypatch)
+    assert routes._lookup_cli_session_metadata("old-one", all_profiles=True)[
+        "session_id"
+    ] == "old-one"
+    assert None in loads, f"the aggregate snapshot survived an external write: {loads}"
+
+
+# ── 7. Recency window and the streaming freeze ──────────────────────────
+
+
+def test_recency_eviction_is_not_undone_by_the_confirmation_read(profiles):
+    """A session evicted from the catalog window must stay absent.
+
+    ``get_cli_session_by_id`` deliberately resolves explicit opens *outside*
+    any recency window (#8265), so a source-scoped confirmation is not a
+    catalog-membership check. The lookup must prove membership itself: when the
+    snapshot no longer describes the current catalog it defers to the
+    enumeration, which is the only thing that knows the window.
+
+    The lookup happens BEFORE any re-enumeration on purpose: enumerating first
+    would replace the snapshot and hide the stale-hint schedule entirely.
     """
     state, homes = profiles
     db = homes["alpha"] / "state.db"
     _make_state_db(db, [("old-one", "cli", "Old one")])
 
-    marker = ("streaming", ("turn-1",))
-    monkeypatch.setattr(models, "_cli_sessions_streaming_freeze_marker", lambda: marker)
+    models.get_cli_sessions()  # prime while it is still in the window
+    assert models.lookup_cli_session_row("old-one")["session_id"] == "old-one"
+
+    _add_newer_sessions(db, prefix="new")
+
+    # Look up through the consumer BEFORE anything re-enumerates.
+    assert routes._lookup_cli_session_metadata("old-one") == {}
+    assert "old-one" not in {r["session_id"] for r in models.get_cli_sessions()}
+
+
+def test_streaming_transition_re_enumerates_instead_of_reusing_the_idle_hint(
+    profiles, monkeypatch
+):
+    """A marker transition must not reuse the idle snapshot."""
+    state, homes = profiles
+    _make_state_db(homes["alpha"] / "state.db", [("mid-turn", "cli", "Mid turn")])
+
+    models.get_cli_sessions()  # prime while idle
+    monkeypatch.setattr(
+        models, "_cli_sessions_streaming_freeze_marker", lambda: ("streaming", ("turn-1",))
+    )
+
+    loads = _count_loads(monkeypatch)
+    assert routes._lookup_cli_session_metadata("mid-turn")["session_id"] == "mid-turn"
+    assert None in loads, f"the idle snapshot was reused across the transition: {loads}"
+
+
+def test_expired_streaming_hint_cannot_outlive_the_producer_ttl(profiles, monkeypatch):
+    """Under a frozen key, an expired snapshot must defer to the enumeration."""
+    state, homes = profiles
+    db = homes["alpha"] / "state.db"
+    _make_state_db(db, [("old-one", "cli", "Old one")])
+
+    monkeypatch.setattr(
+        models, "_cli_sessions_streaming_freeze_marker", lambda: ("streaming", ("turn-1",))
+    )
     models.get_cli_sessions()  # prime under the frozen key
+    _add_newer_sessions(db, prefix="new")
 
-    # 40 newer sessions arrive; the frozen key does not move.
-    conn = sqlite3.connect(str(db))
-    try:
-        for i in range(40):
-            started = 1781024055.0 + 100 + i
-            conn.execute(
-                "INSERT OR REPLACE INTO sessions "
-                "(id, source, model, message_count, started_at, title, cwd) "
-                "VALUES (?, 'cli', 'test-model', 2, ?, ?, '/tmp')",
-                (f"new-{i:02d}", started, f"New {i}"),
-            )
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) "
-                "VALUES (?, 'user', 'hi', ?)",
-                (f"new-{i:02d}", started),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-    # Expire the frozen entry without changing its key.
     with models._CLI_SESSIONS_CACHE_LOCK:
         for key in list(models._CLI_SESSIONS_CACHE):
             entry = models._CLI_SESSIONS_CACHE[key]
             models._CLI_SESSIONS_CACHE[key] = (0.0, entry[1], entry[2])
 
-    loads = []
-    real_load = models._load_cli_sessions_uncached
-
-    def _counting(*args, **kwargs):
-        loads.append(kwargs.get("session_ids"))
-        return real_load(*args, **kwargs)
-
-    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
-
+    loads = _count_loads(monkeypatch)
     assert routes._lookup_cli_session_metadata("old-one") == {}
     # A full enumeration ran (the trailing ('old-one',) read is master's
     # pre-existing oneshot fallback, not the hint path).
     assert None in loads, f"expected a full enumeration, got {loads}"
-
-
-# ── 11. The all-profiles identity is its own shape ────────────────────────
-
-
-def test_all_profiles_stale_lkg_defers_after_an_external_write(profiles):
-    """A write to a NON-active profile must invalidate the aggregate hint.
-
-    The aggregate key's volatile component is the per-profile context tuple
-    (index 3), not the stable profile-home list (index 4). Those two are easy
-    to confuse, and confusing them makes every expired aggregate snapshot look
-    current — an external write would then resurrect rows forever. This pins
-    the correct index by exercising exactly that write.
-    """
-    state, homes = profiles
-    db_alpha = homes["alpha"] / "state.db"
-    db_bravo = homes["bravo"] / "state.db"
-    _make_state_db(db_alpha, [("old-one", "cli", "Old one")])
-    _make_state_db(db_bravo, [("bravo-one", "cli", "Bravo one")])
-
-    primed = {r["session_id"] for r in models.get_cli_sessions(all_profiles=True)}
-    assert {"old-one", "bravo-one"} <= primed
-
-    # An external writer pushes newer sessions into the INACTIVE profile only.
-    conn = sqlite3.connect(str(db_bravo))
-    try:
-        for i in range(40):
-            started = 1781024055.0 + 100 + i
-            conn.execute(
-                "INSERT OR REPLACE INTO sessions "
-                "(id, source, model, message_count, started_at, title, cwd) "
-                "VALUES (?, 'cli', 'test-model', 2, ?, ?, '/tmp')",
-                (f"new-{i:02d}", started, f"New {i}"),
-            )
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) "
-                "VALUES (?, 'user', 'hi', ?)",
-                (f"new-{i:02d}", started),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-    loads = []
-    real_load = models._load_cli_sessions_uncached
-
-    def _counting(*args, **kwargs):
-        loads.append(kwargs.get("session_ids"))
-        return real_load(*args, **kwargs)
-
-    monkeypatch = pytest.MonkeyPatch()
-    try:
-        monkeypatch.setattr(models, "_load_cli_sessions_uncached", _counting)
-        # old-one is still in the window, so it answers — but it must be the
-        # ENUMERATION that decided, not the pre-write snapshot.
-        assert models.lookup_cli_session_row("old-one", all_profiles=True)["session_id"] == (
-            "old-one"
-        )
-        assert None in loads, f"the aggregate snapshot survived an external write: {loads}"
-    finally:
-        monkeypatch.undo()
-
-
-def test_aggregate_does_not_substitute_an_earlier_profiles_out_of_window_row(profiles):
-    """The confirmation read must not swap the aggregate's owner.
-
-    Same SID in both profiles, but alpha's copy has been pushed out of alpha's
-    own window by newer sessions while bravo's copy is still in bravo's. The
-    aggregate enumeration therefore answers with bravo's row. The bounded
-    reader resolves per profile in aggregate order and would hand back alpha's
-    out-of-window row — which is a different owner, not a confirmation.
-    """
-    state, homes = profiles
-    db_alpha = homes["alpha"] / "state.db"
-    db_bravo = homes["bravo"] / "state.db"
-    _make_state_db(db_alpha, [("shared", "cli", "Alpha copy")])
-    _make_state_db(db_bravo, [("shared", "cli", "Bravo copy")])
-
-    # Bury alpha's copy outside alpha's window.
-    conn = sqlite3.connect(str(db_alpha))
-    try:
-        for i in range(40):
-            started = 1781024055.0 + 100 + i
-            conn.execute(
-                "INSERT OR REPLACE INTO sessions "
-                "(id, source, model, message_count, started_at, title, cwd) "
-                "VALUES (?, 'cli', 'test-model', 2, ?, ?, '/tmp')",
-                (f"alpha-new-{i:02d}", started, f"Alpha {i}"),
-            )
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) "
-                "VALUES (?, 'user', 'hi', ?)",
-                (f"alpha-new-{i:02d}", started),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-    enumerated = models.get_cli_sessions(all_profiles=True)
-    owner = next(r for r in enumerated if r["session_id"] == "shared")
-    assert owner["profile"] == "bravo", "bravo should own the aggregate row"
-
-    got = models.lookup_cli_session_row("shared", all_profiles=True)
-    assert got["profile"] == owner["profile"]
-    assert got["title"] == owner["title"]
