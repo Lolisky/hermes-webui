@@ -9932,98 +9932,170 @@ def _cli_sessions_cache_ttl_seconds() -> float:
 # costs seconds, and the cache key embeds a live state.db fingerprint — meaning
 # every agent write invalidates it again. Hot request paths that only need ONE
 # session's metadata (``/api/session/import_cli``, ``/api/git-info``) must not
-# pay that cost: they read an existing snapshot, and when none is cached they
-# warm it out-of-band instead of blocking the request.
+# pay that cost.
+#
+# Contract (per the #8412 review): a cached snapshot is a HINT, never a second
+# source of truth. A hint hit is confirmed by a bounded authoritative single-SID
+# read; a miss — including "the producer says this SID is gone" — falls through
+# to the original enumeration. Hints are looked up ONLY under the exact cache
+# identity the producer used, so one profile's snapshot can never answer for
+# another profile.
 _CLI_SESSIONS_WARM_INFLIGHT: set = set()
 _CLI_SESSIONS_WARM_INFLIGHT_LOCK = threading.Lock()
 
 
-def peek_cli_sessions_index(*, all_profiles: bool = False) -> dict:
-    """Return ``{session_id: row}`` from a cached CLI-sessions snapshot.
+def _cli_sessions_hint_candidates(*, all_profiles: bool) -> list:
+    """Collect candidate hint snapshots for the CALLER's exact identity.
 
-    Rebuild-free companion to :func:`get_cli_sessions`. Never triggers the heavy
-    projection and never raises for missing/garbled cache state: it simply
-    returns ``{}`` so the caller can fall back to a real lookup.
-
-    Both fresh and expired-but-valid snapshots are considered — the projection
-    behind them is expensive and its rows barely change — but entries whose
-    invalidation stamp no longer matches are skipped, since those describe a
-    catalog that was explicitly cleared.
+    Returns ``[(is_fresh, expires_at, rows), ...]`` ordered best-first (fresh
+    snapshots first, then the most recently expired). Both the primary cache and
+    the stable-identity last-known-good map are consulted, but only under the
+    identity the request actually resolves to: the primary cache entry is used
+    only when its key EQUALS the caller's current full cache key, and the LKG
+    entry only under the stable projection of that same key (which drops just
+    the volatile state.db fingerprint component). Entries whose invalidation
+    stamp no longer matches are skipped — they describe a catalog that was
+    explicitly cleared.
     """
+    try:
+        full_key, _load = _cli_sessions_lookup_identity(all_profiles=all_profiles)
+        if full_key is None:
+            return []
+        stable_key = _cli_sessions_stable_cache_identity(full_key)
+    except Exception:
+        logger.debug("CLI sessions lookup identity failed", exc_info=True)
+        return []
+
+    stamp_now = _cli_sessions_cache_invalidation_stamp()
     now = time.monotonic()
-    stamp_now = _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
     candidates = []
     with _CLI_SESSIONS_CACHE_LOCK:
-        for key, entry in list(_CLI_SESSIONS_CACHE.items()):
+        primary = _CLI_SESSIONS_CACHE.get(full_key)
+        if primary is not None:
             try:
-                key_is_all = bool(key) and str(key[0]) == 'all_profiles'
-            except Exception:
-                continue
-            if key_is_all != bool(all_profiles):
-                continue
-            try:
-                if len(entry) == 3:
-                    expires_at, entry_stamp, sessions = entry
+                if len(primary) == 3:
+                    expires_at, entry_stamp, sessions = primary
                 else:
-                    expires_at, sessions = entry
+                    expires_at, sessions = primary
                     entry_stamp = stamp_now
             except Exception:
-                continue
-            if entry_stamp != stamp_now:
-                continue
-            candidates.append((bool(expires_at > now), expires_at, sessions))
-    if not candidates:
-        return {}
-    # Fresh snapshots first, then the most recently expired one.
+                sessions = None
+            if sessions is not None and entry_stamp == stamp_now:
+                candidates.append((bool(expires_at > now), expires_at, sessions))
+        lkg = _CLI_SESSIONS_LAST_KNOWN_GOOD.get(stable_key)
+        if lkg is not None:
+            try:
+                entry_stamp, sessions = lkg
+            except Exception:
+                sessions = None
+            if sessions is not None and entry_stamp == stamp_now:
+                candidates.append((False, 0.0, sessions))
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    for _fresh, _expires_at, sessions in candidates:
-        index = _cli_sessions_rows_by_id(sessions)
-        if index:
-            return index
-    return {}
+    return candidates
 
 
-def _cli_sessions_rows_by_id(sessions) -> dict:
-    index = {}
+def _cli_sessions_lookup_identity(*, all_profiles: bool):
+    """Resolve the caller's cache identity, mirroring ``get_cli_sessions``.
+
+    Returns ``(cache_key, load_sessions)`` where ``load_sessions`` reproduces
+    exactly the projection ``get_cli_sessions`` would run under that identity
+    (same contexts, same source filter, same Claude Code handling), or
+    ``(None, None)`` when the identity cannot be resolved. The cache-key
+    construction MUST stay in lockstep with ``get_cli_sessions``: this is the
+    identity under which the fast path reads hints and the warm pass writes
+    them.
+    """
+    if all_profiles:
+        contexts, context_cache_key = _all_profiles_cli_contexts()
+        stable_context_cache_key = tuple(
+            (_path_cache_key(ctx_home), str(ctx_profile or 'default'))
+            for ctx_home, _ctx_db_path, ctx_profile in contexts
+        )
+        _streaming_marker = _cli_sessions_streaming_freeze_marker()
+        if _streaming_marker is not None:
+            context_cache_key = ('streaming-frozen', _streaming_marker)
+        cache_key = (
+            'all_profiles',
+            '',
+            True,
+            context_cache_key,
+            stable_context_cache_key,
+            _path_cache_key(_default_claude_code_projects_dir()),
+            _path_stat_cache_key(_default_claude_code_projects_dir()),
+            _path_stat_cache_key(SESSION_INDEX_FILE),
+        )
+
+        def _load_all() -> list:
+            merged: list = []
+            for ctx_home, ctx_db_path, ctx_profile in contexts:
+                try:
+                    profile_loaded = _load_cli_sessions_uncached(
+                        ctx_home,
+                        ctx_db_path,
+                        ctx_profile,
+                        source_filter=None,
+                        visible_session_limit=None,
+                        project_assigned_limit=PROJECT_ASSIGNED_CLI_LIMIT,
+                        cron_project_limit=None,
+                        webhook_project_limit=None,
+                        kanban_project_limit=None,
+                        include_claude_code=False,
+                    )
+                except (OSError, sqlite3.Error):
+                    logger.debug(
+                        "CLI sessions warm skipped profile %s", ctx_profile,
+                        exc_info=True,
+                    )
+                    continue
+                if isinstance(profile_loaded, _CliSessionsLoadResult):
+                    merged.extend(profile_loaded.sessions)
+                else:
+                    merged.extend(profile_loaded)
+            try:
+                merged.extend(get_claude_code_sessions())
+            except Exception:
+                logger.debug("CLI sessions warm Claude Code scan failed", exc_info=True)
+            return merged
+
+        return cache_key, _load_all
+    _home, _db, _profile, cache_key = _resolve_cli_sessions_context(
+        None, include_claude_code=True,
+    )
+
+    def _load_one() -> list:
+        loaded = _load_cli_sessions_uncached(
+            _home,
+            _db,
+            _profile,
+            source_filter=None,
+            include_claude_code=True,
+        )
+        if isinstance(loaded, _CliSessionsLoadResult):
+            return loaded.sessions
+        return loaded
+
+    return cache_key, _load_one
+
+
+def _cli_sessions_cli_invalidation_stamp() -> int:
+    with _CLI_SESSIONS_CACHE_LOCK:
+        return int(_CLI_SESSIONS_CACHE_INVALIDATION_VERSION)
+
+
+def _cli_sessions_first_row_by_id(sessions, session_id: str):
+    """Return the FIRST row matching ``session_id``.
+
+    Enumeration's first-match semantics: when an aggregate carries duplicate
+    SIDs, ``get_cli_sessions()`` answers with the first row, and callers must
+    see exactly that row, not a later duplicate.
+    """
     for row in sessions or ():
         try:
-            sid = row.get('session_id')
+            if row.get('session_id') == session_id:
+                return row
         except AttributeError:
             continue
-        if sid:
-            index[sid] = row
-    return index
-
-
-def peek_cli_sessions_last_known_good_index(*, all_profiles: bool = False) -> dict:
-    """Same as :func:`peek_cli_sessions_index`, over the last-known-good map.
-
-    The primary cache is keyed by a tuple that embeds a live ``state.db``
-    fingerprint, so a key churn (any agent write) makes the snapshot
-    unreachable even though it is perfectly usable. The last-known-good map is
-    keyed by the *stable* identity that deliberately drops that component, which
-    is what lets single-session lookups keep hitting after a write.
-    """
-    stamp_now = _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
-    with _CLI_SESSIONS_CACHE_LOCK:
-        entries = list(_CLI_SESSIONS_LAST_KNOWN_GOOD.items())
-    for key, entry in entries:
-        try:
-            key_is_all = bool(key) and str(key[0]) == 'all_profiles'
-        except Exception:
-            continue
-        if key_is_all != bool(all_profiles):
-            continue
-        try:
-            entry_stamp, sessions = entry
-        except Exception:
-            continue
-        if entry_stamp != stamp_now:
-            continue
-        index = _cli_sessions_rows_by_id(sessions)
-        if index:
-            return index
-    return {}
+    return None
 
 
 def warm_cli_sessions_cache_async(*, all_profiles: bool = False) -> bool:
@@ -10045,7 +10117,22 @@ def warm_cli_sessions_cache_async(*, all_profiles: bool = False) -> bool:
 
     def _run() -> None:
         try:
-            get_cli_sessions(all_profiles=all_profiles)
+            cache_key, load_sessions = _cli_sessions_lookup_identity(
+                all_profiles=all_profiles,
+            )
+            if cache_key is None:
+                return
+            stamp = _cli_sessions_cache_invalidation_stamp()
+            _load_and_cache_cli_sessions(
+                cache_key=cache_key,
+                ttl=_cli_sessions_cache_ttl_seconds(),
+                invalidation_stamp=stamp,
+                load_sessions=load_sessions,
+                stale_sessions=None,
+                stale_stamp=None,
+                all_profiles=all_profiles,
+                db_path='warm',
+            )
         except Exception:
             logger.debug("background CLI sessions warm failed", exc_info=True)
         finally:
@@ -10064,43 +10151,84 @@ def warm_cli_sessions_cache_async(*, all_profiles: bool = False) -> bool:
     return True
 
 
+def _confirm_cli_session_hint(
+    session_id: str,
+    row: dict,
+    *,
+    all_profiles: bool,
+) -> dict | None:
+    """Confirm a hinted row with a bounded authoritative single-SID read.
+
+    Returns the authoritative row, ``{}`` when the producer says the SID is not
+    in the caller's scope (an external delete/rename, a profile switch), or
+    ``None`` when the authoritative read could not run — the caller must then
+    fall through to full enumeration rather than trust the hint.
+
+    The bounded read is scoped to the hinted row's own source, never a
+    sourceless read: a sourceless single-SID read carries no source filter and
+    would answer for rows outside every enumerated view, re-opening the exact
+    scope hole this path exists to close. A hint without a resolvable source is
+    not confirmable. Resolved through the module-level name so tests and
+    plugins that replace the bounded reader keep control.
+    """
+    try:
+        source = row.get('raw_source') or row.get('source_tag') or ''
+        source = _normalize_cli_session_source_filter(source)
+        if not source:
+            return None
+        confirmed = get_cli_session_by_id(
+            session_id, source, all_profiles=all_profiles,
+        )
+    except Exception:
+        logger.debug("CLI session hint confirmation failed", exc_info=True)
+        return None
+    if confirmed is None:
+        # A replacing reader that cannot answer is not authoritative evidence.
+        return None
+    if not confirmed:
+        return {}
+    return _copy_cli_sessions([confirmed])[0]
+
+
 def lookup_cli_session_row(
     session_id: str,
     *,
     all_profiles: bool = False,
 ) -> dict:
-    """Resolve ONE CLI session's sidebar row, cache-first.
+    """Resolve ONE CLI session's sidebar row without the full projection.
 
-    Behaviorally identical to enumerating :func:`get_cli_sessions` and picking
-    the matching row — every caller keeps the same hit/miss semantics — but the
-    enumeration only happens when no snapshot is cached at all. On a long-lived
-    install that projection reads a multi-GB ``state.db`` and costs seconds, and
-    this lookup runs on ~15 request paths (session detail, share, rename,
-    delete, archive, git-info, import), including ones whose miss turns into a
-    bogus "Session not found".
+    Semantics are exactly the enumeration's — a hit is a row
+    :func:`get_cli_sessions` would return for the SAME resolved scope, confirmed
+    by a bounded authoritative single-SID read; a miss (including a row that an
+    external writer deleted or moved out of scope) returns ``{}`` and the caller
+    falls through to the original enumeration. The win is that the common case
+    — a live session whose scope the sidebar projection just served — answers
+    from the cached snapshot plus one bounded read instead of re-projecting a
+    multi-GB ``state.db``.
 
-    Two snapshots are consulted before falling back: the primary cache (may be
-    expired but still valid) and the stable-identity last-known-good map, which
-    survives the ``state.db`` fingerprint churn that makes the primary key
-    unreachable after any agent write.
+    Cache entries are consulted only under the producer's own identity (see
+    :func:`_cli_sessions_hint_candidates`), so alpha's snapshot never answers a
+    bravo request; the authoritative read is identity-scoped by construction.
+    Returned rows are defensive copies, as the established cache API does.
     """
-    if not session_id:
+    sid = str(session_id or '').strip()
+    if not sid:
         return {}
-    row = peek_cli_sessions_index(all_profiles=all_profiles).get(session_id)
-    if row is not None:
-        return row
-    row = peek_cli_sessions_last_known_good_index(all_profiles=all_profiles).get(session_id)
-    if row is not None:
-        return row
-    # Genuinely cold (fresh process, nothing cached yet). Do the real lookup —
-    # this is what the original code always did — and server startup warms the
-    # catalog in the background so later requests take the fast path.
-    try:
-        for row in get_cli_sessions(all_profiles=all_profiles):
-            if row.get('session_id') == session_id:
-                return row
-    except Exception:
-        logger.debug("cli session lookup failed", exc_info=True)
+    for _fresh, _expires_at, sessions in _cli_sessions_hint_candidates(
+        all_profiles=all_profiles,
+    ):
+        hint = _cli_sessions_first_row_by_id(sessions, sid)
+        if hint is None:
+            continue
+        confirmed = _confirm_cli_session_hint(sid, hint, all_profiles=all_profiles)
+        if confirmed is None:
+            # Unconfirmable (no source / read failed) — not authoritative
+            # evidence of absence; let the caller's enumeration answer.
+            return {}
+        if confirmed:
+            return confirmed
+        # The producer says this row is gone from this identity; keep scanning
+        # remaining candidates, then fall through to enumeration.
     return {}
 
 
