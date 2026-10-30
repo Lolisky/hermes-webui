@@ -1,27 +1,19 @@
 """Single-session CLI metadata lookups must not re-project the whole catalog.
 
 ``_lookup_cli_session_metadata()`` used to call ``get_cli_sessions()`` — a
-projection over the whole agent ``state.db`` — and then scan the result for one
-id. That projection costs seconds once the database grows, and its cache key
-embeds a live ``state.db`` fingerprint, so an agent write makes the snapshot
-unreachable and the next lookup pays again. A single page load issued several
-of these lookups and paid the projection each time.
+projection over the whole agent ``state.db``, returning a deep copy of every
+sidebar row — and then scan it for one id. That projection costs seconds once
+the database grows; even a cache *hit* pays a full deep copy. A single page
+load issues several of these lookups.
 
-``lookup_cli_session_row()`` is a **probe of the producer's own cache**: it
-answers only when the snapshot it finds is provably what a current enumeration
-would return, and returns ``{}`` otherwise so the caller falls back to
-``get_cli_sessions()``. It never enumerates itself and never answers from a
-snapshot it cannot vouch for.
+``lookup_cli_session_row()`` answers from the producer's own cache entry, and
+only while the producer itself would serve that entry. That makes its answer
+equal to the enumeration's **by definition** rather than by argument, and it
+returns ``{}`` otherwise so the caller enumerates.
 
-These tests pin both halves:
-
-1. it answers without re-projecting (the perf win), and
-2. it never answers for a snapshot it cannot vouch for — different profile,
-   different revision, disabled cache, a streaming freeze past its freshness
-   window, or a confirmation that resolves a different owner.
+These tests pin both halves: it answers without re-projecting, and it never
+answers from an entry the producer would have rebuilt.
 """
-import os
-
 import pytest
 
 from api import models, routes
@@ -68,25 +60,7 @@ def stubbed_catalog(monkeypatch):
         models.clear_cli_sessions_cache()
 
 
-def _authoritative_reader(rows):
-    """A bounded-reader stand-in mirroring get_cli_session_by_id's contract."""
-
-    def _read(sid, source, **kwargs):
-        for row in rows:
-            if row.get("session_id") != sid:
-                continue
-            row_source = models._normalize_cli_session_source_filter(
-                row.get("raw_source") or row.get("source_tag") or ""
-            )
-            if row_source == source:
-                return dict(row)
-        return {}
-
-    return _read
-
-
 def _prime():
-    """Populate the producer cache through the real producer."""
     return models.get_cli_sessions()
 
 
@@ -98,7 +72,7 @@ def _expire_primary():
 
 
 def _count_enumerations(monkeypatch, rows=None):
-    """Make every enumeration path record a call and answer ``rows``."""
+    """Make both enumeration paths record a call and answer ``rows``."""
     calls = []
 
     def _enum(*args, **kwargs):
@@ -111,27 +85,21 @@ def _count_enumerations(monkeypatch, rows=None):
 
 
 def _block_fallback_reads(monkeypatch):
-    """Silence the route's pre-existing ``oneshot`` fallback read.
-
-    ``_lookup_cli_session_metadata`` retries ``get_cli_session_by_id`` for a
-    few sources after the enumeration misses. ``routes`` holds its own
-    reference to that function, so a ``models``-level patch does not reach it.
-    """
+    """Silence the route's pre-existing ``oneshot`` fallback read."""
     monkeypatch.setattr(routes, "get_cli_session_by_id", lambda *a, **kw: {})
 
 
-# ── The fast path answers, and answers correctly ──────────────────────────
+# ── It answers, and answers exactly like the enumeration ──────────────────
 
 
 def test_lookup_matches_full_enumeration(stubbed_catalog):
     """The fast path returns exactly the row the enumeration returns."""
     expected = {row["session_id"]: row for row in _prime()}
-    assert expected, "fixture should produce rows"
+    assert expected
 
     for session_id, row in expected.items():
         assert models.lookup_cli_session_row(session_id) == row
 
-    # Unknown and empty ids keep the enumeration's "not found" answer ({}).
     assert models.lookup_cli_session_row("no-such-session-id") == {}
     assert models.lookup_cli_session_row("") == {}
 
@@ -141,8 +109,8 @@ def test_metadata_lookup_does_not_enumerate_when_snapshot_is_cached(
 ):
     """A cached catalog answers the lookup without re-running the projection.
 
-    This is the behavioural assertion: on the pre-fix code the second call
-    below re-entered ``get_cli_sessions()`` (the spy raises).
+    The behavioural assertion: on the pre-fix code the second call below
+    re-entered ``get_cli_sessions()`` (the spy raises).
     """
     target = ROWS[0]["session_id"]
     assert routes._lookup_cli_session_metadata(target)["session_id"] == target
@@ -157,74 +125,100 @@ def test_metadata_lookup_does_not_enumerate_when_snapshot_is_cached(
         )
 
     monkeypatch.setattr(routes, "get_cli_sessions", _boom)
-    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
-
-    meta = routes._lookup_cli_session_metadata(target)
-    assert meta["session_id"] == target
+    assert routes._lookup_cli_session_metadata(target)["session_id"] == target
     assert enumerations == []
 
 
-def test_expired_snapshot_still_answers(stubbed_catalog, monkeypatch):
-    """TTL expiry alone must not force a re-projection.
+def test_returned_row_is_a_defensive_copy(stubbed_catalog):
+    """Mutating the answer must not poison the cached snapshot."""
+    target = ROWS[0]["session_id"]
+    assert _prime()
 
-    Expiry changes freshness, not membership: the revision is unchanged, so
-    the snapshot still describes the current catalog and the bounded read
-    confirms the content.
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        cached = [
+            r
+            for entry in models._CLI_SESSIONS_CACHE.values()
+            for r in entry[2]
+            if r["session_id"] == target
+        ]
+    assert cached, "the positive cache entry should still be there"
+    aliased = cached[0]
+
+    row = models.lookup_cli_session_row(target)
+    assert row["title"] == "Fastpath A"
+    assert row is not aliased
+    row["title"] = "mutated by the caller"
+    assert aliased["title"] == "Fastpath A"
+
+
+def test_aggregate_duplicate_sid_first_match_wins(stubbed_catalog, monkeypatch):
+    """Duplicate SIDs answer with the FIRST row, as the enumeration scans."""
+    rows = [dict(ROWS[0], title="first"), dict(ROWS[0], title="last"), ROWS[1]]
+    monkeypatch.setattr(
+        models, "_load_cli_sessions_uncached", lambda *a, **kw: [dict(r) for r in rows]
+    )
+    models.clear_cli_sessions_cache()
+    enumerated = _prime()
+    expected = next(r for r in enumerated if r["session_id"] == ROWS[0]["session_id"])
+    assert expected["title"] == "first"
+    assert models.lookup_cli_session_row(ROWS[0]["session_id"])["title"] == "first"
+
+
+def test_lookup_keeps_the_enumerators_exact_id_comparison(stubbed_catalog):
+    """Ids compare exactly as the enumeration compares them."""
+    assert _prime()
+    for sid in (" cli-fastpath-a ", "CLI-FASTPATH-A", 123, "", None):
+        assert models.lookup_cli_session_row(sid) == {}, sid
+
+
+# ── It never answers from an entry the producer would rebuild ─────────────
+
+
+def test_expired_snapshot_defers_to_the_enumeration(stubbed_catalog, monkeypatch):
+    """Expiry is the producer's rebuild trigger, so the lookup must defer.
+
+    A rebuild can disagree with the snapshot through inputs the key never sees
+    — sidecar contents, in-place row UPDATEs, another session entering the
+    window — so an expired entry is not evidence of what the enumeration would
+    return.
     """
     target = ROWS[0]["session_id"]
     assert _prime()
     _expire_primary()
 
-    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
+    assert models.lookup_cli_session_row(target) == {}
+
+    _block_fallback_reads(monkeypatch)
     enumerations = _count_enumerations(monkeypatch)
-    assert routes._lookup_cli_session_metadata(target)["session_id"] == target
-    assert enumerations == [], "an unchanged revision must not re-project"
+    assert routes._lookup_cli_session_metadata(target) == {}
+    assert enumerations == [1], "an expired snapshot must defer to enumeration"
 
 
-def test_metadata_lookup_honours_a_replaced_enumeration(stubbed_catalog, monkeypatch):
-    """A caller that replaces ``get_cli_sessions()`` still drives the lookup.
-
-    The fast path is an optimisation, not a second source of truth: with
-    nothing cached, the module-level enumeration decides.
-    """
-    rows = [{"session_id": "replaced-enumeration-1", "profile": "default"}]
-
-    models.clear_cli_sessions_cache()
-    monkeypatch.setattr(models, "_load_cli_sessions_uncached", lambda *a, **kw: [])
-    monkeypatch.setattr(routes, "get_cli_sessions", lambda **kw: [dict(r) for r in rows])
-
-    assert routes._lookup_cli_session_metadata("replaced-enumeration-1") == rows[0]
-    assert routes._lookup_cli_session_metadata("not-in-the-enumeration") == {}
-
-
-def test_returned_row_is_a_defensive_copy(stubbed_catalog, monkeypatch):
-    """Mutating the returned row must not poison the cached snapshot.
-
-    The reader is made to hand back the cached row object itself — the exact
-    aliasing the first cut of this PR had. Without a defensive copy, mutating
-    the answer poisons the snapshot for every later request.
-    """
+def test_cold_cache_defers(stubbed_catalog, monkeypatch):
+    """With nothing cached the lookup cannot vouch for anything."""
     target = ROWS[0]["session_id"]
+    models.clear_cli_sessions_cache()
+    _block_fallback_reads(monkeypatch)
+    enumerations = _count_enumerations(monkeypatch, [dict(ROWS[0])])
+    assert routes._lookup_cli_session_metadata(target)["session_id"] == target
+    assert enumerations == [1]
+
+
+def test_disabled_cache_defers(stubbed_catalog, monkeypatch):
+    """``get_cli_sessions`` gates its whole cache path on ``ttl > 0``."""
     assert _prime()
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 0)
+    assert models.lookup_cli_session_row(ROWS[0]["session_id"]) == {}
 
+
+def test_stale_invalidation_stamp_defers(stubbed_catalog):
+    """An explicitly cleared catalog leaves no usable entry."""
+    assert _prime()
     with models._CLI_SESSIONS_CACHE_LOCK:
-        cached_rows = [r for entry in models._CLI_SESSIONS_CACHE.values() for r in entry[2]]
-    assert cached_rows, "the positive cache entry should still be there"
-    aliased = next(r for r in cached_rows if r["session_id"] == target)
-    monkeypatch.setattr(
-        models, "get_cli_session_by_id", lambda sid, source, **kw: aliased
-    )
-
-    row = models.lookup_cli_session_row(target)
-    assert row["title"] == "Fastpath A"
-    assert row is not aliased, "the answer aliased the cached snapshot"
-    row["title"] = "mutated by the caller"
-    assert aliased["title"] == "Fastpath A", (
-        "mutating the answer poisoned the cached snapshot"
-    )
-
-
-# ── The snapshot must never outlive what it can vouch for ────────────────
+        for key in list(models._CLI_SESSIONS_CACHE):
+            entry = models._CLI_SESSIONS_CACHE[key]
+            models._CLI_SESSIONS_CACHE[key] = (entry[0], entry[1] - 1, entry[2])
+    assert models.lookup_cli_session_row(ROWS[0]["session_id"]) == {}
 
 
 def test_lookup_does_not_answer_across_profiles(stubbed_catalog, monkeypatch):
@@ -239,297 +233,12 @@ def test_lookup_does_not_answer_across_profiles(stubbed_catalog, monkeypatch):
     assert models.lookup_cli_session_row(target) == {}
 
 
-def test_disabled_cache_never_answers_from_a_snapshot(stubbed_catalog, monkeypatch):
-    """With the CLI cache disabled the producer re-projects, so must the lookup.
-
-    ``get_cli_sessions`` gates its whole cache path on ``ttl > 0``. Serving an
-    expired snapshot here would answer what the producer would have rebuilt.
-    """
-    assert _prime()
-    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 0)
-
-    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
-    assert models.lookup_cli_session_row(ROWS[0]["session_id"]) == {}
-
-
-@pytest.mark.parametrize("all_profiles", [False, True])
-def test_expired_frozen_snapshot_defers_to_the_enumeration(
-    stubbed_catalog, monkeypatch, all_profiles
-):
-    """A frozen key hides writes, so past its freshness window it proves nothing.
-
-    Under the streaming freeze (#4842) the producer's key stops tracking
-    state.db for the length of a turn. Two snapshots can share that key
-    without describing the same catalog, so once the entry is expired the
-    producer would have re-projected — and so must the lookup.
-    """
-    monkeypatch.setattr(
-        models, "_cli_sessions_streaming_freeze_marker", lambda: ("streaming", ("t1",))
-    )
+def test_metadata_lookup_honours_a_replaced_enumeration(stubbed_catalog, monkeypatch):
+    """A caller that replaces ``get_cli_sessions()`` still drives the lookup."""
+    rows = [{"session_id": "replaced-enumeration-1", "profile": "default"}]
     models.clear_cli_sessions_cache()
-    assert models.get_cli_sessions(all_profiles=all_profiles)
-    _expire_primary()
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", lambda *a, **kw: [])
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda **kw: [dict(r) for r in rows])
 
-    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
-    _block_fallback_reads(monkeypatch)
-    enumerations = _count_enumerations(monkeypatch)
-    assert routes._lookup_cli_session_metadata(
-        ROWS[0]["session_id"], all_profiles=all_profiles
-    ) == {}
-    assert enumerations == [1]
-
-
-@pytest.mark.parametrize("all_profiles", [False, True])
-def test_fresh_frozen_snapshot_still_answers(stubbed_catalog, monkeypatch, all_profiles):
-    """Within its freshness window a frozen snapshot is what the producer serves."""
-    monkeypatch.setattr(
-        models, "_cli_sessions_streaming_freeze_marker", lambda: ("streaming", ("t1",))
-    )
-    models.clear_cli_sessions_cache()
-    assert models.get_cli_sessions(all_profiles=all_profiles)
-
-    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
-    enumerations = _count_enumerations(monkeypatch)
-    got = models.lookup_cli_session_row(
-        ROWS[0]["session_id"], all_profiles=all_profiles
-    )
-    assert got["session_id"] == ROWS[0]["session_id"]
-    assert enumerations == []
-
-
-# ── The confirmation must actually confirm ───────────────────────────────
-
-
-def test_hint_without_authoritative_row_falls_through(stubbed_catalog, monkeypatch):
-    """An external DELETE: the bounded read answers {} → the enumeration decides."""
-    target = ROWS[0]["session_id"]
-    assert _prime()
-    _expire_primary()  # expired but the revision is unchanged
-    assert models.lookup_cli_session_row(target)["session_id"] == target
-
-    monkeypatch.setattr(models, "get_cli_session_by_id", lambda sid, source, **kw: {})
-    _block_fallback_reads(monkeypatch)
-    enumerations = _count_enumerations(monkeypatch)
-    assert routes._lookup_cli_session_metadata(target) == {}
-    assert enumerations == [1]
-
-
-def test_hint_confirmed_returns_fresh_authoritative_row(stubbed_catalog, monkeypatch):
-    """An external title UPDATE: the confirmed row is the AUTHORITATIVE one.
-
-    The hint selects the candidate; the producer supplies the content.
-    """
-    target = ROWS[0]["session_id"]
-    assert _prime()
-    _expire_primary()  # expired but the revision is unchanged
-    assert models.lookup_cli_session_row(target)["title"] == "Fastpath A"
-
-    fresh = dict(ROWS[0], title="Renamed externally")
-    monkeypatch.setattr(
-        models, "get_cli_session_by_id", lambda sid, source, **kw: dict(fresh)
-    )
-    assert models.lookup_cli_session_row(target)["title"] == "Renamed externally"
-
-
-def test_confirmation_must_reproduce_the_hinted_owner(stubbed_catalog, monkeypatch):
-    """A confirmation that returns another profile's row is not a confirmation.
-
-    In a multi-profile install the bounded reader resolves a SID per profile in
-    aggregate order, so it can hand back an EARLIER profile's row for the same
-    SID even when that profile's own window no longer contains it.
-    """
-    target = ROWS[0]["session_id"]
-    assert _prime()
-    _expire_primary()  # expired but the revision is unchanged
-    assert models.lookup_cli_session_row(target)["profile"] == "default"
-
-    monkeypatch.setattr(
-        models,
-        "get_cli_session_by_id",
-        lambda sid, source, **kw: dict(ROWS[0], profile="alpha"),
-    )
-    enumerations = _count_enumerations(monkeypatch, [dict(ROWS[0])])
-    assert routes._lookup_cli_session_metadata(target)["profile"] == "default"
-    assert enumerations == [1], "a foreign-owner confirmation must defer"
-
-
-def test_unconfirmable_hint_never_answers(stubbed_catalog, monkeypatch):
-    """A hint with no resolvable source cannot be confirmed → enumeration wins."""
-    rows = [
-        {
-            "session_id": "cli-fastpath-nosrc",
-            "profile": "default",
-            "title": "No source",
-        }
-    ]
-    monkeypatch.setattr(
-        models, "_load_cli_sessions_uncached", lambda *a, **kw: [dict(r) for r in rows]
-    )
-    models.clear_cli_sessions_cache()
-    assert _prime()
-    _expire_primary()  # expired but the revision is unchanged
-
-    enumerations = _count_enumerations(
-        monkeypatch, [dict(rows[0], title="from enumeration")]
-    )
-    assert routes._lookup_cli_session_metadata("cli-fastpath-nosrc")["title"] == (
-        "from enumeration"
-    )
-    assert enumerations == [1]
-
-
-def test_claude_code_hint_does_not_pay_an_unanswerable_read(stubbed_catalog, monkeypatch):
-    """A Claude Code hint must not spend a bounded read that can only say ``{}``.
-
-    Those rows are global, and the bounded reader loads with
-    ``include_claude_code=False``, so it can neither confirm nor refute them.
-    """
-    rows = [
-        {
-            "session_id": "cc-1",
-            "profile": "default",
-            "raw_source": "claude_code",
-            "source_tag": "claude_code",
-            "title": "Claude Code",
-        }
-    ]
-    monkeypatch.setattr(
-        models, "_load_cli_sessions_uncached", lambda *a, **kw: [dict(r) for r in rows]
-    )
-    models.clear_cli_sessions_cache()
-    assert _prime()
-    _expire_primary()  # expired but the revision is unchanged
-
-    reads = []
-    monkeypatch.setattr(
-        models, "get_cli_session_by_id", lambda *a, **kw: reads.append(1) or {}
-    )
-    enumerations = _count_enumerations(monkeypatch, [dict(rows[0])])
-    assert routes._lookup_cli_session_metadata("cc-1")["session_id"] == "cc-1"
-    assert reads == [], "the bounded reader cannot answer a Claude Code row"
-    assert enumerations == [1]
-
-
-# ── Enumeration-equivalence edges ────────────────────────────────────────
-
-
-def test_lookup_keeps_the_enumerators_exact_id_comparison(stubbed_catalog):
-    """Ids compare exactly as the enumeration compares them.
-
-    ``_lookup_cli_session_metadata`` compares ``row["session_id"] == session_id``
-    with no normalisation, so a padded string or a non-string id is a miss
-    there. Normalising here would answer ids the enumeration never matches.
-    """
-    assert _prime()
-    for sid in (" cli-fastpath-a ", "CLI-FASTPATH-A", 123, "", None):
-        assert models.lookup_cli_session_row(sid) == {}, sid
-
-
-def test_aggregate_duplicate_sid_first_match_wins(stubbed_catalog, monkeypatch):
-    """Duplicate SIDs answer with the FIRST row, as the enumeration scans."""
-    # Different sources, so picking the LAST duplicate is observable: the
-    # confirmation records which source the chosen hint carried.
-    dup_first = dict(ROWS[0], title="first", raw_source="cli", source_tag="cli")
-    dup_last = dict(ROWS[0], title="last", raw_source="cron", source_tag="cron")
-    rows = [dup_first, dup_last, ROWS[1]]
-    monkeypatch.setattr(
-        models, "_load_cli_sessions_uncached", lambda *a, **kw: [dict(r) for r in rows]
-    )
-    models.clear_cli_sessions_cache()
-    enumerated = _prime()
-    expected = next(r for r in enumerated if r["session_id"] == ROWS[0]["session_id"])
-    assert expected["title"] == "first"
-    _expire_primary()  # the confirmation only runs for an expired snapshot
-
-    seen = []
-
-    def _echo(sid, source, **kw):
-        seen.append((sid, source))
-        return next(r for r in rows if r["title"] == "first")
-
-    monkeypatch.setattr(models, "get_cli_session_by_id", _echo)
-    got = models.lookup_cli_session_row(ROWS[0]["session_id"])
-    assert got["title"] == "first"
-    assert seen == [(ROWS[0]["session_id"], "cli")]
-
-
-# ── Membership inputs the cache key cannot see ───────────────────────────
-
-
-@pytest.mark.parametrize("field", models._CLI_SESSIONS_MEMBERSHIP_FIELDS)
-def test_a_moved_membership_field_defers_to_the_enumeration(
-    stubbed_catalog, monkeypatch, field
-):
-    """If a window-relevant field moved, the hint no longer describes the catalog.
-
-    The cache key cannot see every projection input: a sidecar's ``project_id``
-    or a re-timed row can move a session in or out of the window without moving
-    the state.db fingerprint. The bounded read already returns the LIVE row, so
-    the lookup compares the fields the window keys on and defers when they
-    differ.
-    """
-    target = ROWS[0]["session_id"]
-    assert _prime()
-    _expire_primary()  # expired but the revision is unchanged
-    assert models.lookup_cli_session_row(target)["session_id"] == target
-
-    moved = dict(ROWS[0])
-    moved[field] = "moved-value" if field != "archived" else True
-    monkeypatch.setattr(
-        models, "get_cli_session_by_id", lambda sid, source, **kw: dict(moved)
-    )
-    assert models.lookup_cli_session_row(target) == {}
-
-
-def test_a_stable_membership_field_still_answers(stubbed_catalog, monkeypatch):
-    """The guard must not reject a hint whose window-relevant fields match."""
-    target = ROWS[0]["session_id"]
-    assert _prime()
-    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
-    got = models.lookup_cli_session_row(target)
-    assert got["session_id"] == target
-
-
-def test_sidecar_directory_is_part_of_the_identity(stubbed_catalog, tmp_path, monkeypatch):
-    """Adding or removing a sidecar must invalidate the snapshot.
-
-    Sidecars carry the project assignment the window's recovery passes read.
-    The session index is in the key, but an out-of-process writer can add or
-    remove a sidecar without touching it — the directory's own stat has to
-    participate.
-    """
-    session_dir = tmp_path / "sessions"
-    session_dir.mkdir()
-    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
-    models.clear_cli_sessions_cache()
-
-    key_before = models._cli_sessions_current_cache_key(all_profiles=False)
-    (session_dir / "someone.json").write_text("{}", encoding="utf-8")
-    # This filesystem stamps with ~1ms granularity, so an in-process add can
-    # land in the same tick as the directory's creation. Push the stamp forward
-    # explicitly so the test exercises the mechanism, not the clock.
-    st = session_dir.stat()
-    os.utime(session_dir, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
-    key_after = models._cli_sessions_current_cache_key(all_profiles=False)
-
-    assert key_before != key_after, "a sidecar add/remove must move the key"
-
-
-def test_confirmation_uses_the_hints_own_source(stubbed_catalog, monkeypatch):
-    """The bounded read must be scoped to the hint's source, not a fixed one.
-
-    A sourceless or wrong-source read answers outside the enumerated view, so
-    the confirmation would prove the wrong thing.
-    """
-    sources = []
-
-    def _read(sid, source, **kwargs):
-        sources.append((sid, source))
-        return next((dict(r) for r in ROWS if r["session_id"] == sid), {})
-
-    assert _prime()
-    _expire_primary()  # expired but the revision is unchanged
-    monkeypatch.setattr(models, "get_cli_session_by_id", _read)
-    models.lookup_cli_session_row(ROWS[0]["session_id"])
-    models.lookup_cli_session_row(ROWS[1]["session_id"])
-    assert sources == [(ROWS[0]["session_id"], "cli"), (ROWS[1]["session_id"], "cron")]
+    assert routes._lookup_cli_session_metadata("replaced-enumeration-1") == rows[0]
+    assert routes._lookup_cli_session_metadata("not-in-the-enumeration") == {}

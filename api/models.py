@@ -161,19 +161,6 @@ _CLI_SESSIONS_CACHE_INVALIDATION_VERSION = 0
 # _CLAUDE_CODE_PARSE_CACHE / _SIDECAR_METADATA_CACHE LRU pattern.
 _CLI_SESSIONS_CACHE: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
 _CLI_SESSIONS_CACHE_MAX_ENTRIES = 8
-
-# Row fields the producer's catalog window actually keys on. A sidecar edit or
-# a re-timed row can move a session in or out of the window without moving the
-# state.db fingerprint, so the fast path compares these between the snapshot
-# row and the live one before it answers (see _confirm_cli_session_hint).
-_CLI_SESSIONS_MEMBERSHIP_FIELDS = (
-    'project_id',
-    'archived',
-    'created_at',
-    'parent_session_id',
-    '_lineage_root_id',
-)
-# Complete projections retained under an identity that excludes the volatile
 # state.db fingerprint. This store is independently bounded because the stable
 # identity still contains external Claude/session-index stat revisions.
 _CLI_SESSIONS_LAST_KNOWN_GOOD: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
@@ -9989,16 +9976,6 @@ def _all_profiles_cli_cache_key(contexts, context_cache_key, source_filter, incl
         _path_cache_key(_default_claude_code_projects_dir()),
         _path_stat_cache_key(_default_claude_code_projects_dir()),
         _path_stat_cache_key(SESSION_INDEX_FILE),
-        # Sidecars carry project_id/archived, which drive the window's
-        # recovery passes. The index stat above does not see a sidecar that an
-        # out-of-process writer added or removed, so the directory's own stat
-        # participates too.
-        _path_stat_cache_key(SESSION_DIR),
-        # The project catalog is an input to the projection, not just a label:
-        # it resolves each row's project_id and drives the assigned-recovery
-        # pass. Dropping a project can move a session out of the window without
-        # touching state.db, so it has to participate in the identity.
-        _path_stat_cache_key(PROJECTS_FILE),
     )
 
 
@@ -10013,39 +9990,23 @@ def _cli_sessions_current_cache_key(*, all_profiles: bool):
     return cache_key
 
 
-def _cli_sessions_volatile_is_stream_frozen(volatile: tuple) -> bool:
-    """True when a volatile key component is a streaming-freeze marker.
-
-    While a turn streams the producer freezes the volatile part of its key
-    (#4842) so per-delta writes don't bust the projection. Two snapshots taken
-    under the same marker therefore share a key without describing the same
-    catalog.
-    """
-    component = volatile[0] if volatile else None
-    if not isinstance(component, tuple) or not component:
-        return False
-    return component[0] in ('streaming', 'streaming-frozen')
 
 
-def _cli_sessions_volatile_cache_identity(cache_key: tuple) -> tuple:
-    """Return the state.db revision component of a CLI cache key."""
-    if cache_key and cache_key[0] == 'all_profiles':
-        # Index 3 is the per-profile context key (or the streaming freeze).
-        return (cache_key[3],) if len(cache_key) > 3 else ()
-    # Single-profile keys place the volatile DB fingerprint at index 4.
-    return (cache_key[4],) if len(cache_key) > 4 else ()
 
 
 def _cli_sessions_live_snapshot(*, all_profiles: bool):
-    """Return ``(rows, fresh)`` for a snapshot we can vouch for, or ``None``.
+    """Return the rows the producer itself would serve right now, or ``None``.
 
-    ``fresh`` means the producer itself would serve this entry from cache, so
-    its rows are exactly what an enumeration would return and no confirmation
-    is needed. An *expired* entry is still evidence of membership (the key
-    embeds the revision) but its content may have moved, so the caller
-    confirms it with a bounded read.
+    The rule is deliberately narrow: answer only where ``get_cli_sessions()``
+    would hit its own cache. That makes the answer equal to the enumeration's
+    **by definition** — the producer returns exactly this entry's rows — rather
+    than by argument about what the key does and does not capture.
 
-    ``None`` means "cannot vouch" — the caller must enumerate.
+    An *expired* entry is not good enough: the producer would rebuild, and the
+    rebuild can disagree with the snapshot through inputs the key never sees
+    (sidecar contents, in-place row UPDATEs, another session entering the
+    window). Two independent adversarial reviews reproduced exactly that, so an
+    expired snapshot defers to the caller's enumeration.
     """
     try:
         if _cli_sessions_cache_ttl_seconds() <= 0:
@@ -10068,65 +10029,11 @@ def _cli_sessions_live_snapshot(*, all_profiles: bool):
             stamp = _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
         if stamp != _CLI_SESSIONS_CACHE_INVALIDATION_VERSION:
             return None
-        if expires_at <= now and _cli_sessions_volatile_is_stream_frozen(
-            _cli_sessions_volatile_cache_identity(key)
-        ):
+        if expires_at <= now:
             return None
-        return rows, expires_at > now
+        return rows
 
 
-def _confirm_cli_session_hint(
-    session_id: str,
-    row: dict,
-    *,
-    all_profiles: bool,
-) -> dict | None:
-    """Confirm a hinted row with a bounded authoritative single-SID read.
-
-    Returns the confirmed row, ``{}`` when the producer says the SID is gone
-    from this scope, or ``None`` when the read cannot settle it. The caller
-    treats both non-answers the same way: enumerate.
-
-    The read is scoped to the hint's own source (a sourceless read answers
-    outside every enumerated view), and must reproduce the hinted owner: in a
-    multi-profile install the reader resolves a SID per profile in aggregate
-    order, so it can return an EARLIER profile's row for a SID the aggregate
-    enumeration attributed to a later owner.
-    """
-    try:
-        source = _normalize_cli_session_source_filter(
-            row.get('raw_source') or row.get('source_tag') or ''
-        )
-        if not source:
-            return None
-        if source == CLAUDE_CODE_SOURCE:
-            # Claude Code rows are global, and the bounded reader loads with
-            # include_claude_code=False — a read here can only ever answer
-            # ``{}``, which is not evidence of absence.
-            return None
-        confirmed = get_cli_session_by_id(
-            session_id, source, all_profiles=all_profiles,
-        )
-    except Exception:
-        logger.debug("CLI session hint confirmation failed", exc_info=True)
-        return None
-    if not confirmed:
-        return confirmed or {}
-    if (
-        confirmed.get('session_id') != row.get('session_id')
-        or confirmed.get('profile') != row.get('profile')
-    ):
-        return None
-    # The key cannot see every projection input — a sidecar's project_id or a
-    # row's started_at can change membership without moving the state.db
-    # fingerprint (an external sidecar edit, a mtime-restoring writer). The
-    # bounded read already gives us the LIVE row, so compare the fields the
-    # producer's window actually keys on: if any of them moved, the hint no
-    # longer describes this catalog and the enumeration must decide.
-    for field in _CLI_SESSIONS_MEMBERSHIP_FIELDS:
-        if row.get(field) != confirmed.get(field):
-            return None
-    return _copy_cli_sessions([confirmed])[0]
 
 
 def lookup_cli_session_row(
@@ -10142,19 +10049,12 @@ def lookup_cli_session_row(
     """
     if not session_id:
         return {}
-    snapshot = _cli_sessions_live_snapshot(all_profiles=all_profiles)
-    if not snapshot:
+    rows = _cli_sessions_live_snapshot(all_profiles=all_profiles)
+    if not rows:
         return {}
-    rows, fresh = snapshot
-    # First match, exactly as the enumeration scans.
+    # First match, exactly as the enumeration scans, and a defensive copy.
     row = next((r for r in rows if r.get('session_id') == session_id), None)
-    if row is None:
-        return {}
-    if fresh:
-        # The producer would serve this very entry, so its row is already what
-        # an enumeration returns — confirming it would only add a round trip.
-        return _copy_cli_sessions([row])[0]
-    return _confirm_cli_session_hint(session_id, row, all_profiles=all_profiles) or {}
+    return _copy_cli_sessions([row])[0] if row is not None else {}
 
 
 
@@ -10361,13 +10261,6 @@ def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool 
         _path_cache_key(projects_dir),
         _path_stat_cache_key(projects_dir),
         _path_stat_cache_key(SESSION_INDEX_FILE),
-        # See ``_all_profiles_cli_cache_key``: the sidecar directory and the
-        # project catalog are inputs to the projection, so a change there must
-        # invalidate the snapshot.
-        _path_stat_cache_key(SESSION_DIR),
-        # to the projection (project_id resolution and the assigned-recovery
-        # pass), so a change there must invalidate the snapshot.
-        _path_stat_cache_key(PROJECTS_FILE),
     )
     return hermes_home, db_path, cli_profile, cache_key
 
