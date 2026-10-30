@@ -14,7 +14,6 @@ miss the transitions that matter. These use:
 No loader is mocked. Every assertion compares the fast path against what the
 enumeration itself returns for the same scope.
 """
-import os
 import sqlite3
 from pathlib import Path
 
