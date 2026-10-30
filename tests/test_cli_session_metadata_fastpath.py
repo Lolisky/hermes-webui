@@ -20,6 +20,8 @@ These tests pin both halves:
    different revision, disabled cache, a streaming freeze past its freshness
    window, or a confirmation that resolves a different owner.
 """
+import os
+
 import pytest
 
 from api import models, routes
@@ -71,7 +73,12 @@ def _authoritative_reader(rows):
 
     def _read(sid, source, **kwargs):
         for row in rows:
-            if row.get("session_id") == sid:
+            if row.get("session_id") != sid:
+                continue
+            row_source = models._normalize_cli_session_source_filter(
+                row.get("raw_source") or row.get("source_tag") or ""
+            )
+            if row_source == source:
                 return dict(row)
         return {}
 
@@ -297,6 +304,7 @@ def test_hint_without_authoritative_row_falls_through(stubbed_catalog, monkeypat
     """An external DELETE: the bounded read answers {} → the enumeration decides."""
     target = ROWS[0]["session_id"]
     assert _prime()
+    _expire_primary()  # expired but the revision is unchanged
     assert models.lookup_cli_session_row(target)["session_id"] == target
 
     monkeypatch.setattr(models, "get_cli_session_by_id", lambda sid, source, **kw: {})
@@ -313,6 +321,7 @@ def test_hint_confirmed_returns_fresh_authoritative_row(stubbed_catalog, monkeyp
     """
     target = ROWS[0]["session_id"]
     assert _prime()
+    _expire_primary()  # expired but the revision is unchanged
     assert models.lookup_cli_session_row(target)["title"] == "Fastpath A"
 
     fresh = dict(ROWS[0], title="Renamed externally")
@@ -331,6 +340,7 @@ def test_confirmation_must_reproduce_the_hinted_owner(stubbed_catalog, monkeypat
     """
     target = ROWS[0]["session_id"]
     assert _prime()
+    _expire_primary()  # expired but the revision is unchanged
     assert models.lookup_cli_session_row(target)["profile"] == "default"
 
     monkeypatch.setattr(
@@ -357,6 +367,7 @@ def test_unconfirmable_hint_never_answers(stubbed_catalog, monkeypatch):
     )
     models.clear_cli_sessions_cache()
     assert _prime()
+    _expire_primary()  # expired but the revision is unchanged
 
     enumerations = _count_enumerations(
         monkeypatch, [dict(rows[0], title="from enumeration")]
@@ -387,6 +398,7 @@ def test_claude_code_hint_does_not_pay_an_unanswerable_read(stubbed_catalog, mon
     )
     models.clear_cli_sessions_cache()
     assert _prime()
+    _expire_primary()  # expired but the revision is unchanged
 
     reads = []
     monkeypatch.setattr(
@@ -415,8 +427,10 @@ def test_lookup_keeps_the_enumerators_exact_id_comparison(stubbed_catalog):
 
 def test_aggregate_duplicate_sid_first_match_wins(stubbed_catalog, monkeypatch):
     """Duplicate SIDs answer with the FIRST row, as the enumeration scans."""
-    dup_first = dict(ROWS[0], title="first")
-    dup_last = dict(ROWS[0], title="last")
+    # Different sources, so picking the LAST duplicate is observable: the
+    # confirmation records which source the chosen hint carried.
+    dup_first = dict(ROWS[0], title="first", raw_source="cli", source_tag="cli")
+    dup_last = dict(ROWS[0], title="last", raw_source="cron", source_tag="cron")
     rows = [dup_first, dup_last, ROWS[1]]
     monkeypatch.setattr(
         models, "_load_cli_sessions_uncached", lambda *a, **kw: [dict(r) for r in rows]
@@ -425,6 +439,7 @@ def test_aggregate_duplicate_sid_first_match_wins(stubbed_catalog, monkeypatch):
     enumerated = _prime()
     expected = next(r for r in enumerated if r["session_id"] == ROWS[0]["session_id"])
     assert expected["title"] == "first"
+    _expire_primary()  # the confirmation only runs for an expired snapshot
 
     seen = []
 
@@ -436,3 +451,85 @@ def test_aggregate_duplicate_sid_first_match_wins(stubbed_catalog, monkeypatch):
     got = models.lookup_cli_session_row(ROWS[0]["session_id"])
     assert got["title"] == "first"
     assert seen == [(ROWS[0]["session_id"], "cli")]
+
+
+# ── Membership inputs the cache key cannot see ───────────────────────────
+
+
+@pytest.mark.parametrize("field", models._CLI_SESSIONS_MEMBERSHIP_FIELDS)
+def test_a_moved_membership_field_defers_to_the_enumeration(
+    stubbed_catalog, monkeypatch, field
+):
+    """If a window-relevant field moved, the hint no longer describes the catalog.
+
+    The cache key cannot see every projection input: a sidecar's ``project_id``
+    or a re-timed row can move a session in or out of the window without moving
+    the state.db fingerprint. The bounded read already returns the LIVE row, so
+    the lookup compares the fields the window keys on and defers when they
+    differ.
+    """
+    target = ROWS[0]["session_id"]
+    assert _prime()
+    _expire_primary()  # expired but the revision is unchanged
+    assert models.lookup_cli_session_row(target)["session_id"] == target
+
+    moved = dict(ROWS[0])
+    moved[field] = "moved-value" if field != "archived" else True
+    monkeypatch.setattr(
+        models, "get_cli_session_by_id", lambda sid, source, **kw: dict(moved)
+    )
+    assert models.lookup_cli_session_row(target) == {}
+
+
+def test_a_stable_membership_field_still_answers(stubbed_catalog, monkeypatch):
+    """The guard must not reject a hint whose window-relevant fields match."""
+    target = ROWS[0]["session_id"]
+    assert _prime()
+    monkeypatch.setattr(models, "get_cli_session_by_id", _authoritative_reader(ROWS))
+    got = models.lookup_cli_session_row(target)
+    assert got["session_id"] == target
+
+
+def test_sidecar_directory_is_part_of_the_identity(stubbed_catalog, tmp_path, monkeypatch):
+    """Adding or removing a sidecar must invalidate the snapshot.
+
+    Sidecars carry the project assignment the window's recovery passes read.
+    The session index is in the key, but an out-of-process writer can add or
+    remove a sidecar without touching it — the directory's own stat has to
+    participate.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    models.clear_cli_sessions_cache()
+
+    key_before = models._cli_sessions_current_cache_key(all_profiles=False)
+    (session_dir / "someone.json").write_text("{}", encoding="utf-8")
+    # This filesystem stamps with ~1ms granularity, so an in-process add can
+    # land in the same tick as the directory's creation. Push the stamp forward
+    # explicitly so the test exercises the mechanism, not the clock.
+    st = session_dir.stat()
+    os.utime(session_dir, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    key_after = models._cli_sessions_current_cache_key(all_profiles=False)
+
+    assert key_before != key_after, "a sidecar add/remove must move the key"
+
+
+def test_confirmation_uses_the_hints_own_source(stubbed_catalog, monkeypatch):
+    """The bounded read must be scoped to the hint's source, not a fixed one.
+
+    A sourceless or wrong-source read answers outside the enumerated view, so
+    the confirmation would prove the wrong thing.
+    """
+    sources = []
+
+    def _read(sid, source, **kwargs):
+        sources.append((sid, source))
+        return next((dict(r) for r in ROWS if r["session_id"] == sid), {})
+
+    assert _prime()
+    _expire_primary()  # expired but the revision is unchanged
+    monkeypatch.setattr(models, "get_cli_session_by_id", _read)
+    models.lookup_cli_session_row(ROWS[0]["session_id"])
+    models.lookup_cli_session_row(ROWS[1]["session_id"])
+    assert sources == [(ROWS[0]["session_id"], "cli"), (ROWS[1]["session_id"], "cron")]

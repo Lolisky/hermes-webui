@@ -14,6 +14,7 @@ miss the transitions that matter. These use:
 No loader is mocked. Every assertion compares the fast path against what the
 enumeration itself returns for the same scope.
 """
+import os
 import sqlite3
 from pathlib import Path
 
@@ -377,8 +378,9 @@ def test_current_snapshot_answers_without_reprojecting(profiles, monkeypatch):
 
     row = models.lookup_cli_session_row("live-one")
     assert row["session_id"] == "live-one"
-    # Exactly one bounded single-SID read; no full projection.
-    assert loads == [("live-one",)], loads
+    # A fresh snapshot is exactly what the producer would serve, so there is
+    # neither a projection nor a confirmation read.
+    assert loads == [], loads
 
 
 def test_expired_but_unchanged_snapshot_still_answers(profiles, monkeypatch):
